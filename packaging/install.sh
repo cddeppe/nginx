@@ -52,20 +52,35 @@ require_root() {
 # aborted by a conffile prompt). Safe to call repeatedly.
 repair_dpkg_state() {
     # Check if any package is in a half-configured/half-installed state
-    if dpkg -l 2>/dev/null | awk '/^[a-z][a-zA-Z]/ {print $1}' | grep -qE '^(iF|iU|iH|hF|iW|iT|trig|rc)'; then
-        log "Detected half-configured packages — repairing dpkg state"
-        DEBIAN_FRONTEND=noninteractive dpkg --configure -a \
-            -o Dpkg::Options::="--force-confold" \
-            -o Dpkg::Options::="--force-confdef" 2>/dev/null || \
-            DEBIAN_FRONTEND=noninteractive dpkg --configure --force-confold --force-confdef -a
-    fi
+    # Status codes: iF=half-conf, iU=unpacked, iH=half-inst, iW=awaiting trigger,
+    #               iT=trigger-pending, trig=trigger-awaiting
+    local broken
+    broken=$(dpkg -l 2>/dev/null | awk '/^[a-z][a-zA-Z]/ {print $1}' | grep -cE '^(iF|iU|iH|iW|iT)$' || echo 0)
 
-    # Specifically check if nginx-geosite is in a broken state
-    if dpkg -l nginx-geosite 2>/dev/null | awk '{print $1}' | grep -qE '^(iF|iU|iH|iW|iT)$'; then
-        log "Repairing nginx-geosite package state"
-        DEBIAN_FRONTEND=noninteractive dpkg --configure nginx-geosite \
-            --force-confold --force-confdef 2>&1 | tail -3 || true
+    if [[ "$broken" -gt 0 ]]; then
+        log "Detected $broken half-configured package(s) — repairing dpkg state"
+        # dpkg --configure needs --force-confold directly (not via -o Dpkg::Options)
+        DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold --force-confdef 2>&1 | tail -5 || true
     fi
+}
+
+# Write an apt config snippet that forces --force-confold globally for the
+# duration of the install. This ensures EVERY dpkg invocation (whether from
+# apt-get install, dpkg --configure, or postinst scripts) keeps the existing
+# conffile instead of prompting. Removed at the end of the install.
+force_confold_setup() {
+    mkdir -p /etc/apt/apt.conf.d
+    cat > /etc/apt/apt.conf.d/99nginx-geosite-install <<'CONF'
+Dpkg::Options {
+    "--force-confold";
+    "--force-confdef";
+};
+APT::Get::Assume-Yes "true";
+CONF
+}
+
+force_confold_cleanup() {
+    rm -f /etc/apt/apt.conf.d/99nginx-geosite-install
 }
 
 detect_arch() {
@@ -157,13 +172,10 @@ install_deb() {
     local deb_path="$1"
     log "Installing $deb_path (this replaces any stock nginx)"
     # apt install resolves dependencies and handles Conflicts/Replaces properly.
-    # Use --force-confold so dpkg doesn't prompt about the modified nginx.conf
-    # (we always want to keep the user's existing config, not overwrite it with
-    # the package's default). This makes the install fully non-interactive.
-    DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        -o Dpkg::Options::="--force-confold" \
-        -o Dpkg::Options::="--force-confdef" \
-        "$deb_path"
+    # force_confold_setup() already wrote /etc/apt/apt.conf.d/99nginx-geosite-install
+    # which forces --force-confold globally, so this apt-get install is fully
+    # non-interactive even when upgrading over a modified /etc/nginx/nginx.conf.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$deb_path"
 }
 
 download_geosite() {
@@ -280,6 +292,13 @@ main() {
     require_root
     log "Installing nginx-geosite"
 
+    # Force --force-confold globally for the duration of this install.
+    # This is the bulletproof way to prevent dpkg conffile prompts —
+    # any dpkg invocation (apt-get install, dpkg --configure, postinst)
+    # will keep the existing conffile instead of prompting.
+    force_confold_setup
+    trap "force_confold_cleanup" EXIT
+
     # Repair any half-configured dpkg state from a previous broken install
     # (e.g. a prior run that aborted on a conffile prompt). Safe no-op if clean.
     repair_dpkg_state
@@ -298,7 +317,7 @@ main() {
 
     local tmp_dir
     tmp_dir="$(mktemp -d)"
-    trap "rm -rf '$tmp_dir'" EXIT
+    trap "rm -rf '$tmp_dir'; force_confold_cleanup" EXIT
 
     local deb_path
     deb_path="$(download_latest_deb "$arch" "$tmp_dir")"
