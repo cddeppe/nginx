@@ -33,6 +33,12 @@ typedef struct {
     ngx_uint_t                       proxy_protocol;
     ngx_flag_t                       half_close;
     ngx_stream_upstream_local_t     *local;
+    /*
+     * Interface name (or complex value evaluating to one) for
+     * SO_BINDTODEVICE on the upstream connect socket. Empty / "off"
+     * means no binding. See ngx_event_connect_peer() for the kernel side.
+     */
+    ngx_stream_complex_value_t      *interface;
     ngx_flag_t                       socket_keepalive;
     size_t                           socket_rcvbuf;
     size_t                           socket_sndbuf;
@@ -94,6 +100,10 @@ static char *ngx_stream_proxy_pass(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_stream_proxy_bind(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_stream_proxy_interface(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static ngx_int_t ngx_stream_proxy_set_interface(ngx_stream_session_t *s,
+    ngx_stream_upstream_t *u, ngx_stream_complex_value_t *interface_cv);
 
 #if (NGX_STREAM_SSL)
 
@@ -165,6 +175,22 @@ static ngx_command_t  ngx_stream_proxy_commands[] = {
     { ngx_string("proxy_bind"),
       NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE12,
       ngx_stream_proxy_bind,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      0,
+      NULL },
+
+    /*
+     * proxy_interface <name | $variable | off>
+     *
+     * Bind the upstream connection to the named network interface via
+     * SO_BINDTODEVICE (Linux). Typically used with $egress_iface, which
+     * is itself computed from $geosite_category via a `map`.
+     *
+     * Requires CAP_NET_RAW on the worker process.
+     */
+    { ngx_string("proxy_interface"),
+      NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_stream_proxy_interface,
       NGX_STREAM_SRV_CONF_OFFSET,
       0,
       NULL },
@@ -473,6 +499,11 @@ ngx_stream_proxy_handler(ngx_stream_session_t *s)
     u->peer.log_error = NGX_ERROR_ERR;
 
     if (ngx_stream_proxy_set_local(s, u, pscf->local) != NGX_OK) {
+        ngx_stream_proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    if (ngx_stream_proxy_set_interface(s, u, pscf->interface) != NGX_OK) {
         ngx_stream_proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
         return;
     }
@@ -2429,6 +2460,7 @@ ngx_stream_proxy_create_srv_conf(ngx_conf_t *cf)
     conf->next_upstream = NGX_CONF_UNSET;
     conf->proxy_protocol = NGX_CONF_UNSET_UINT;
     conf->local = NGX_CONF_UNSET_PTR;
+    conf->interface = NGX_CONF_UNSET_PTR;
     conf->socket_keepalive = NGX_CONF_UNSET;
     conf->socket_rcvbuf = NGX_CONF_UNSET_SIZE;
     conf->socket_sndbuf = NGX_CONF_UNSET_SIZE;
@@ -2489,6 +2521,7 @@ ngx_stream_proxy_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_uint_value(conf->proxy_protocol, prev->proxy_protocol, 0);
 
     ngx_conf_merge_ptr_value(conf->local, prev->local, NULL);
+    ngx_conf_merge_ptr_value(conf->interface, prev->interface, NULL);
 
     ngx_conf_merge_value(conf->socket_keepalive,
                               prev->socket_keepalive, 0);
@@ -2901,4 +2934,93 @@ ngx_stream_proxy_bind(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     return NGX_CONF_OK;
+}
+
+
+/*
+ * proxy_interface <name | $variable | off>
+ *
+ * Compiles its argument as a stream complex value, so it can be a literal
+ * interface name ("wg0") or a variable ("$egress_iface"). The special
+ * value "off" disables interface binding (and is what an empty variable
+ * evaluates to at runtime, so `map` blocks can fall through to "off" for
+ * the default case).
+ *
+ * The complex value is stored in pscf->interface. At connect time,
+ * ngx_stream_proxy_set_interface() evaluates it; if the result is empty
+ * or "off", no SO_BINDTODEVICE is performed. Otherwise the result is
+ * handed to ngx_event_connect_peer() via u->peer.interface.
+ */
+static char *
+ngx_stream_proxy_interface(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_stream_proxy_srv_conf_t        *pscf = conf;
+    ngx_str_t                           *value;
+    ngx_stream_complex_value_t           cv;
+    ngx_stream_compile_complex_value_t   ccv;
+
+    if (pscf->interface != NGX_CONF_UNSET_PTR) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+
+    if (ngx_strcmp(value[1].data, "off") == 0) {
+        pscf->interface = NULL;
+        return NGX_CONF_OK;
+    }
+
+    ngx_memzero(&ccv, sizeof(ngx_stream_compile_complex_value_t));
+    ccv.cf = cf;
+    ccv.value = &value[1];
+    ccv.complex_value = &cv;
+
+    if (ngx_stream_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    pscf->interface = ngx_palloc(cf->pool, sizeof(ngx_stream_complex_value_t));
+    if (pscf->interface == NULL) {
+        return NGX_CONF_ERROR;
+    }
+    *pscf->interface = cv;
+
+    return NGX_CONF_OK;
+}
+
+
+/*
+ * Evaluate pscf->interface for this session and stash the result on
+ * u->peer.interface. The string is allocated from the connection pool
+ * so it survives until the upstream connection is established.
+ */
+static ngx_int_t
+ngx_stream_proxy_set_interface(ngx_stream_session_t *s,
+    ngx_stream_upstream_t *u, ngx_stream_complex_value_t *interface_cv)
+{
+    ngx_str_t  *val;
+
+    if (interface_cv == NULL) {
+        u->peer.interface = NULL;
+        return NGX_OK;
+    }
+
+    val = ngx_palloc(s->connection->pool, sizeof(ngx_str_t));
+    if (val == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (ngx_stream_complex_value(s, interface_cv, val) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (val->len == 0
+        || (val->len == 3 && ngx_strncmp(val->data, "off", 3) == 0))
+    {
+        u->peer.interface = NULL;
+        return NGX_OK;
+    }
+
+    u->peer.interface = val;
+    return NGX_OK;
 }

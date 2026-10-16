@@ -55,6 +55,17 @@ struct ngx_peer_connection_s {
 
     ngx_addr_t                      *local;
 
+    /*
+     * Optional interface name (e.g. "wg0", "ak", "alb") for SO_BINDTODEVICE.
+     * If non-NULL and non-empty, the outbound socket is bound to this
+     * interface via setsockopt(SO_BINDTODEVICE) before connect(). This is
+     * the Linux equivalent of Xray's sockopt.interface. The string must
+     * be NUL-terminated and shorter than IFNAMSIZ (16 bytes).
+     *
+     * Requires CAP_NET_RAW (or root).
+     */
+    ngx_str_t                       *interface;
+
     int                              type;
     int                              rcvbuf;
     int                              sndbuf;

@@ -10,6 +10,10 @@
 #include <ngx_event.h>
 #include <ngx_event_connect.h>
 
+#if (NGX_LINUX)
+#include <net/if.h>
+#endif
+
 
 #if (NGX_HAVE_TRANSPARENT_PROXY)
 static ngx_int_t ngx_event_connect_set_transparent(ngx_peer_connection_t *pc,
@@ -168,6 +172,45 @@ ngx_event_connect_peer(ngx_peer_connection_t *pc)
             goto failed;
         }
     }
+
+#if (NGX_LINUX)
+    /*
+     * Bind the outbound socket to a named network interface via
+     * SO_BINDTODEVICE. This is the Linux equivalent of Xray's
+     * sockopt.interface setting. The interface name (e.g. "wg0") is
+     * pinned regardless of its IP address, which is exactly what
+     * wg-quick tunnels need (their IPs are not stable).
+     *
+     * Requires CAP_NET_RAW. Failure is fatal — better to refuse the
+     * connection than silently route via the wrong interface.
+     */
+    if (pc->interface && pc->interface->len > 0) {
+        struct ifreq  ifr;
+
+        if (pc->interface->len >= IFNAMSIZ) {
+            ngx_log_error(NGX_LOG_ALERT, pc->log, 0,
+                          "interface name \"%V\" too long (max %d)",
+                          pc->interface, IFNAMSIZ - 1);
+            goto failed;
+        }
+
+        ngx_memzero(&ifr, sizeof(struct ifreq));
+        ngx_memcpy(ifr.ifr_name, pc->interface->data, pc->interface->len);
+
+        if (setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE,
+                       (const void *) &ifr, sizeof(struct ifreq)) == -1)
+        {
+            err = ngx_socket_errno;
+            ngx_log_error(NGX_LOG_CRIT, pc->log, err,
+                          "setsockopt(SO_BINDTODEVICE, \"%V\") failed "
+                          "(requires CAP_NET_RAW)", pc->interface);
+            goto failed;
+        }
+
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, pc->log, 0,
+                       "SO_BINDTODEVICE: %V", pc->interface);
+    }
+#endif
 
     if (type == SOCK_STREAM) {
         c->recv = ngx_recv;

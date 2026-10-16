@@ -1332,6 +1332,20 @@ if [ $STREAM != NO ]; then
 
         . auto/module
     fi
+
+    # ngx_stream_geosite_module — always built when stream is enabled.
+    # Loads v2ray/xray geosite.dat and exposes $geosite_category.
+    # Pairs with the proxy_interface directive (in ngx_stream_proxy_module)
+    # to provide Xray-equivalent geosite routing via SO_BINDTODEVICE.
+    if [ $STREAM = YES ]; then
+        ngx_module_name=ngx_stream_geosite_module
+        ngx_module_deps=
+        ngx_module_srcs=src/stream/ngx_stream_geosite_module.c
+        ngx_module_libs=
+        ngx_module_link=YES
+
+        . auto/module
+    fi
 fi
 
 
