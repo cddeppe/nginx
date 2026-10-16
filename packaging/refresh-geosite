@@ -1,0 +1,66 @@
+#!/bin/bash
+#
+# /etc/cron.weekly/refresh-geosite
+#
+# Refreshes the v2fly geosite dlc.dat weekly, then reloads nginx so the
+# new categories take effect. Safe to run manually:
+#   /etc/cron.weekly/refresh-geosite
+#
+set -euo pipefail
+
+URL="https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat"
+DEST="/usr/local/etc/xray/domains/dlc.dat"
+BACKUP="${DEST}.bak"
+TMP="$(mktemp)"
+CLEANUP() { rm -f "$TMP"; }
+trap CLEANUP EXIT
+
+# Don't run if nginx-geosite isn't installed
+if [[ ! -x /usr/sbin/nginx ]]; then
+    echo "refresh-geosite: /usr/sbin/nginx not found, skipping" >&2
+    exit 0
+fi
+
+# Download to tmp
+echo "refresh-geosite: downloading $URL"
+if ! wget -q -O "$TMP" "$URL"; then
+    echo "refresh-geosite: download failed, keeping existing $DEST" >&2
+    exit 1
+fi
+
+# Sanity check: file must be > 1 MB (real dlc.dat is ~2-3 MB)
+SIZE="$(stat -c%s "$TMP" 2>/dev/null || stat -f%z "$TMP" 2>/dev/null || echo 0)"
+if [[ "$SIZE" -lt 1000000 ]]; then
+    echo "refresh-geosite: downloaded file too small ($SIZE bytes), discarding" >&2
+    exit 1
+fi
+
+# Verify nginx can still parse the new file before swapping
+echo "refresh-geosite: downloaded $SIZE bytes, verifying nginx can parse..."
+cp "$TMP" "${DEST}.test"
+chmod 644 "${DEST}.test"
+TEST_OUTPUT="$(nginx -t 2>&1)" || {
+    echo "refresh-geosite: nginx -t failed with new dlc.dat, keeping old one:"
+    echo "$TEST_OUTPUT"
+    rm -f "${DEST}.test"
+    exit 1
+}
+rm -f "${DEST}.test"
+
+# Backup old, swap in new
+if [[ -f "$DEST" ]]; then
+    cp "$DEST" "$BACKUP"
+fi
+mv "$TMP" "$DEST"
+chmod 644 "$DEST"
+chown root:root "$DEST"
+
+# Reload nginx to pick up new geosite data
+echo "refresh-geosite: swapping in new $DEST and reloading nginx"
+if systemctl reload nginx 2>/dev/null; then
+    echo "refresh-geosite: nginx reloaded with new dlc.dat"
+else
+    echo "refresh-geosite: nginx reload failed, but new dlc.dat is in place" >&2
+    echo "refresh-geosite: manual recovery: systemctl restart nginx" >&2
+    exit 1
+fi

@@ -1,0 +1,152 @@
+# ---------------------------------------------------------------------------
+# /etc/nginx/nginx.conf — example config with geosite + proxy_interface
+#
+# This file ships as /etc/nginx/nginx.conf.example alongside the package.
+# To use it: cp /etc/nginx/nginx.conf.example /etc/nginx/nginx.conf
+#
+# Requires:
+#   - nginx-geosite package (cddeppe nginx fork)
+#   - dlc.dat at /usr/local/etc/xray/domains/dlc.dat (auto-installed)
+#   - CAP_NET_RAW on the binary (auto-set by the package postinst)
+#
+# Mirror of the original Xray routing config:
+#   geosite:amazon / hulu / disney / netflix → wireguard (iface "ak")
+#   intuit.com / *.intuit.com                → wireguard (iface "ak")
+#   dns.controld.com                         → direct
+#   everything else                          → direct, original port
+# ---------------------------------------------------------------------------
+
+user www-data;
+worker_processes auto;
+worker_rlimit_nofile 200000;
+pid /run/nginx.pid;
+error_log /var/log/nginx/error.log warn;
+
+events {
+    worker_connections 65536;
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    log_format basic '$remote_addr [$time_local] '
+                     '--$server_name $server_port --serveraddr:$server_addr '
+                     '--$ssl_server_name $ssl_server_name';
+
+    access_log /var/log/nginx/access.log basic buffer=256k flush=5s;
+
+    keepalive_requests 1000;
+    keepalive_timeout 75s;
+
+    # Example: HTTP → HTTPS redirect (edit IPs to match your server)
+    # server {
+    #     listen 82.21.4.42:80 bind reuseport so_keepalive=on;
+    #     listen [2a0e:7d43:0:1::1]:80 bind reuseport so_keepalive=on;
+    #     http2 on;
+    #     return 301 https://$host$request_uri;
+    # }
+}
+
+stream {
+    # -------------------------------------------------------------------
+    # 1. Load the geosite database.
+    #    Auto-downloaded by the package postinst to:
+    #      /usr/local/etc/xray/domains/dlc.dat
+    #    Auto-refreshed weekly by /etc/cron.weekly/refresh-geosite
+    # -------------------------------------------------------------------
+    geosite_load /usr/local/etc/xray/domains/dlc.dat;
+
+    #    Only load the categories we route on — saves ~150 MB of RAM
+    #    compared to loading all 250+ categories in the file.
+    geosite_filter amazon hulu disney netflix;
+
+    #    Optional: tune hash tables. Defaults (256 / 16384) work for the
+    #    full v2fly dlc.dat. If you see "could not build geosite_domain_hash"
+    #    in error.log, double bucket_size.
+    # geosite_hash_bucket_size 512;
+    # geosite_hash_max_size 32768;
+
+    log_format basic '$remote_addr [$time_local] '
+                     '--$ssl_alpn_protocol $ssl_preread_server_name $server_port '
+                     '--serveraddr:$server_addr --$ssl_server_name $hostname '
+                     'geosite=$geosite_category iface=$final_iface';
+
+    access_log /var/log/nginx/nginx-access.log basic buffer=256k flush=5s;
+
+    # -------------------------------------------------------------------
+    # 2. Backend selection (edit to match your setup)
+    # -------------------------------------------------------------------
+    map $ssl_preread_server_name $target_backend {
+        # nas.deppe.cc                      "$ssl_preread_server_name:3064";
+        default                           "$ssl_preread_server_name:$server_port";
+    }
+
+    # -------------------------------------------------------------------
+    # 3. Geosite → egress interface (Xray outboundTag equivalent)
+    # -------------------------------------------------------------------
+    map $geosite_category $geosite_iface {
+        default  off;
+        amazon   ak;     # wg-quick interface name
+        hulu     ak;
+        disney   ak;
+        netflix  ak;
+    }
+
+    # -------------------------------------------------------------------
+    # 4. Bare-domain overrides (Xray "domain:" rules)
+    # -------------------------------------------------------------------
+    map $ssl_preread_server_name $domain_override {
+        default                       $geosite_iface;
+        ~*^(.+\.)?intuit\.com$        ak;
+        ~*^(.+\.)?intuitcdn\.net$     ak;
+        ~*^dns\.controld\.com$        off;   # direct, must NOT go through WG
+    }
+
+    # -------------------------------------------------------------------
+    # 5. Final egress decision
+    # -------------------------------------------------------------------
+    map $domain_override $final_iface {
+        ""      $geosite_iface;
+        default $domain_override;
+    }
+
+    # -------------------------------------------------------------------
+    # 6. Main TLS-passthrough proxy (edit IPs to match your server)
+    # -------------------------------------------------------------------
+    server {
+        # listen 82.21.4.42:443 bind reuseport so_keepalive=on rcvbuf=1024m sndbuf=512m fastopen=256;
+        # listen [2a0e:7d43:0:1::1]:443 bind reuseport so_keepalive=on rcvbuf=1024m sndbuf=512m fastopen=256;
+        listen 0.0.0.0:443 bind reuseport so_keepalive=on fastopen=256;
+        listen [::]:443 bind reuseport so_keepalive=on fastopen=256;
+
+        resolver 127.0.0.1 [::1] ipv4=on ipv6=on valid=30s;
+
+        preread_buffer_size 16k;
+        preread_timeout 30s;
+
+        ssl_preread on;
+        tcp_nodelay on;
+
+        proxy_timeout 4h;
+        proxy_connect_timeout 30s;
+        proxy_buffer_size 2048k;
+        proxy_socket_keepalive on;
+        proxy_ssl_session_reuse off;
+
+        # Bind upstream socket to chosen interface via SO_BINDTODEVICE.
+        # Empty / "off" → no bind (use main routing table).
+        proxy_interface $final_iface;
+
+        proxy_pass $target_backend;
+    }
+
+    # -------------------------------------------------------------------
+    # 7. Example NAS backends (uncomment + edit to match your setup)
+    # -------------------------------------------------------------------
+    # server {
+    #     listen 3064 bind reuseport so_keepalive=off rcvbuf=1024m sndbuf=512m fastopen=256;
+    #     listen [::]:3064 bind reuseport so_keepalive=off rcvbuf=1024m sndbuf=512m fastopen=256;
+    #     resolver 127.0.0.1 [::1] ipv4=on ipv6=off valid=1s;
+    #     proxy_pass nas.deppe.cc:3064;
+    # }
+}
