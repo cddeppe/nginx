@@ -9,6 +9,10 @@
 #include <ngx_core.h>
 #include <ngx_event.h>
 
+#if (NGX_LINUX)
+#include <net/if.h>
+#endif
+
 
 #define NGX_RESOLVER_UDP_SIZE   4096
 
@@ -261,6 +265,31 @@ ngx_resolver_create(ngx_conf_t *cf, ngx_str_t *names, ngx_uint_t n)
             continue;
         }
 #endif
+
+        /*
+         * interface=<name> — bind resolver UDP/TCP sockets to the named
+         * network interface via SO_BINDTODEVICE. Bypasses kernel routing,
+         * so DNS queries go through WireGuard (or any interface) without
+         * needing static routes or AllowedIPs trickery.
+         */
+        if (ngx_strncmp(names[i].data, "interface=", 10) == 0) {
+            s.len = names[i].len - 10;
+            s.data = names[i].data + 10;
+
+            if (s.len == 0 || s.len >= 16) {  /* IFNAMSIZ = 16 */
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "invalid interface name in \"%V\"",
+                                   &names[i]);
+                return NULL;
+            }
+
+            r->interface = ngx_palloc(cf->pool, sizeof(ngx_str_t));
+            if (r->interface == NULL) {
+                return NULL;
+            }
+            *r->interface = s;
+            continue;
+        }
 
         ngx_memzero(&u, sizeof(ngx_url_t));
 
@@ -4491,6 +4520,48 @@ ngx_udp_connect(ngx_resolver_connection_t *rec)
         goto failed;
     }
 
+#if (NGX_LINUX)
+    /*
+     * Bind the resolver UDP socket to a named network interface via
+     * SO_BINDTODEVICE. Bypasses the kernel routing table — DNS queries
+     * egress through the specified interface (e.g. a WireGuard tunnel)
+     * without needing static routes or AllowedIPs entries. Same semantics
+     * as proxy_interface, but for DNS instead of proxy_pass.
+     *
+     * Requires CAP_NET_RAW.
+     */
+    if (rec->resolver && rec->resolver->interface
+        && rec->resolver->interface->len > 0)
+    {
+        struct ifreq  ifr;
+
+        if (rec->resolver->interface->len >= IFNAMSIZ) {
+            ngx_log_error(NGX_LOG_ALERT, &rec->log, 0,
+                          "resolver interface name \"%V\" too long (max %d)",
+                          rec->resolver->interface, IFNAMSIZ - 1);
+            goto failed;
+        }
+
+        ngx_memzero(&ifr, sizeof(struct ifreq));
+        ngx_memcpy(ifr.ifr_name, rec->resolver->interface->data,
+                   rec->resolver->interface->len);
+
+        if (setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE,
+                       (const void *) &ifr, sizeof(struct ifreq)) == -1)
+        {
+            ngx_log_error(NGX_LOG_ALERT, &rec->log, ngx_socket_errno,
+                          "setsockopt(SO_BINDTODEVICE, \"%V\") failed on "
+                          "resolver socket (requires CAP_NET_RAW)",
+                          rec->resolver->interface);
+            goto failed;
+        }
+
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, &rec->log, 0,
+                       "resolver SO_BINDTODEVICE: %V",
+                       rec->resolver->interface);
+    }
+#endif
+
     rev = c->read;
     wev = c->write;
 
@@ -4576,6 +4647,36 @@ ngx_tcp_connect(ngx_resolver_connection_t *rec)
 
         goto failed;
     }
+
+#if (NGX_LINUX)
+    /* Same SO_BINDTODEVICE logic as ngx_udp_connect — see comment there. */
+    if (rec->resolver && rec->resolver->interface
+        && rec->resolver->interface->len > 0)
+    {
+        struct ifreq  ifr;
+
+        if (rec->resolver->interface->len >= IFNAMSIZ) {
+            ngx_log_error(NGX_LOG_ALERT, &rec->log, 0,
+                          "resolver interface name \"%V\" too long (max %d)",
+                          rec->resolver->interface, IFNAMSIZ - 1);
+            goto failed;
+        }
+
+        ngx_memzero(&ifr, sizeof(struct ifreq));
+        ngx_memcpy(ifr.ifr_name, rec->resolver->interface->data,
+                   rec->resolver->interface->len);
+
+        if (setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE,
+                       (const void *) &ifr, sizeof(struct ifreq)) == -1)
+        {
+            ngx_log_error(NGX_LOG_ALERT, &rec->log, ngx_socket_errno,
+                          "setsockopt(SO_BINDTODEVICE, \"%V\") failed on "
+                          "resolver TCP socket (requires CAP_NET_RAW)",
+                          rec->resolver->interface);
+            goto failed;
+        }
+    }
+#endif
 
     rev = c->read;
     wev = c->write;
