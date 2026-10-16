@@ -70,11 +70,25 @@
 
 /*
  * Domain types (v2ray Domain.Type enum).
+ * IMPORTANT: these match the v2ray-core proto definition exactly:
+ *   https://github.com/v2fly/v2ray-core/blob/master/app/router/config.proto
+ *
+ *   enum Type {
+ *     Plain = 0;   // substring match
+ *     Regex = 1;   // regex match (not implemented here)
+ *     Domain = 2;  // suffix match (matches domain + all subdomains)
+ *     Full = 3;    // exact match (case-insensitive)
+ *   }
+ *
+ * DO NOT change these values — they are wire-format constants defined by
+ * the v2ray protobuf schema. A previous version of this code had them
+ * wrong (Domain=1, Full=2, Regex=3), which caused all geosite entries
+ * to be miscategorized and matching to silently fail.
  */
 #define NGX_GEOSITE_TYPE_PLAIN   0
-#define NGX_GEOSITE_TYPE_DOMAIN  1
-#define NGX_GEOSITE_TYPE_FULL    2
-#define NGX_GEOSITE_TYPE_REGEX   3
+#define NGX_GEOSITE_TYPE_REGEX   1
+#define NGX_GEOSITE_TYPE_DOMAIN  2
+#define NGX_GEOSITE_TYPE_FULL    3
 
 
 /*
