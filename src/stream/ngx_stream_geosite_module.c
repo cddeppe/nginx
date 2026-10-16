@@ -109,6 +109,8 @@ typedef struct {
     ngx_array_t                          *filters;     /* ngx_str_t */
     ngx_array_t                          *categories;  /* ngx_stream_geosite_category_t */
     ngx_hash_t                            tag_index;   /* tag (lowercased) → category ptr */
+    ngx_uint_t                            hash_bucket_size;
+    ngx_uint_t                            hash_max_size;
     ngx_flag_t                            loaded;
 } ngx_stream_geosite_main_conf_t;
 
@@ -152,6 +154,35 @@ static ngx_command_t  ngx_stream_geosite_commands[] = {
       ngx_stream_geosite_filter_directive,
       NGX_STREAM_MAIN_CONF_OFFSET,
       0,
+      NULL },
+
+    /*
+     * geosite_hash_bucket_size <size>
+     *
+     * Sets the bucket size for the per-category Full and Domain hash tables.
+     * Must be at least as large as the longest domain entry plus ~32 bytes
+     * of header. Default 256, which covers entries up to ~220 bytes.
+     * If you see "could not build geosite_domain_hash, you should increase
+     * geosite_hash_bucket_size", bump this value (typically double it).
+     */
+    { ngx_string("geosite_hash_bucket_size"),
+      NGX_STREAM_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_STREAM_MAIN_CONF_OFFSET,
+      offsetof(ngx_stream_geosite_main_conf_t, hash_bucket_size),
+      NULL },
+
+    /*
+     * geosite_hash_max_size <size>
+     *
+     * Sets the maximum number of buckets for each per-category hash table.
+     * Default 16384 (handles up to ~100k entries per category comfortably).
+     */
+    { ngx_string("geosite_hash_max_size"),
+      NGX_STREAM_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_STREAM_MAIN_CONF_OFFSET,
+      offsetof(ngx_stream_geosite_main_conf_t, hash_max_size),
       NULL },
 
     ngx_null_command
@@ -279,6 +310,8 @@ ngx_stream_geosite_create_main_conf(ngx_conf_t *cf)
     gmcf->file_path = NULL;
     gmcf->filters = NULL;
     gmcf->categories = NULL;
+    gmcf->hash_bucket_size = NGX_CONF_UNSET_UINT;
+    gmcf->hash_max_size = NGX_CONF_UNSET_UINT;
     gmcf->loaded = 0;
     return gmcf;
 }
@@ -737,6 +770,7 @@ ngx_stream_geosite_build_hashes(ngx_conf_t *cf,
     ngx_hash_keys_arrays_t           tag_keys;
     ngx_hash_init_t                  hash_init;
     ngx_stream_geosite_category_t  **cat_slot;
+    ngx_uint_t                       bucket_size, max_size;
 
     if (gmcf->categories == NULL || gmcf->categories->nelts == 0) {
         ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
@@ -744,6 +778,19 @@ ngx_stream_geosite_build_hashes(ngx_conf_t *cf,
                            "nothing or file is empty)");
         return NGX_OK;
     }
+
+    /*
+     * Default bucket size 256: comfortably fits entries up to ~220 bytes
+     * (real geosite entries can be 80+ bytes for long cloudfront / aws
+     * subdomains). Default max_size 16384: handles categories with up
+     * to ~100k entries with low collision rate.
+     */
+    bucket_size = gmcf->hash_bucket_size == NGX_CONF_UNSET_UINT
+                  ? 256 : gmcf->hash_bucket_size;
+    max_size = gmcf->hash_max_size == NGX_CONF_UNSET_UINT
+               ? 16384 : gmcf->hash_max_size;
+
+    bucket_size = ngx_align(bucket_size, ngx_cacheline_size);
 
     cats = gmcf->categories->elts;
     n = gmcf->categories->nelts;
@@ -758,8 +805,8 @@ ngx_stream_geosite_build_hashes(ngx_conf_t *cf,
 
         hash_init.hash = &cats[i].full_hash;
         hash_init.key = ngx_hash_key_lc;
-        hash_init.max_size = 4096;
-        hash_init.bucket_size = ngx_align(64, ngx_cacheline_size);
+        hash_init.max_size = max_size;
+        hash_init.bucket_size = bucket_size;
         hash_init.name = "geosite_full_hash";
         hash_init.pool = cf->cycle->pool;
         hash_init.temp_pool = cf->pool;
@@ -768,6 +815,12 @@ ngx_stream_geosite_build_hashes(ngx_conf_t *cf,
             if (ngx_hash_init(&hash_init, full_keys->keys.elts,
                               full_keys->keys.nelts) != NGX_OK)
             {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "geosite: failed to build full_hash for "
+                                   "category \"%V\" — try increasing "
+                                   "geosite_hash_bucket_size (currently %ui) "
+                                   "or geosite_hash_max_size (currently %ui)",
+                                   &cats[i].tag, bucket_size, max_size);
                 return NGX_ERROR;
             }
         } else {
@@ -782,6 +835,12 @@ ngx_stream_geosite_build_hashes(ngx_conf_t *cf,
             if (ngx_hash_init(&hash_init, domain_keys->keys.elts,
                               domain_keys->keys.nelts) != NGX_OK)
             {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "geosite: failed to build domain_hash for "
+                                   "category \"%V\" — try increasing "
+                                   "geosite_hash_bucket_size (currently %ui) "
+                                   "or geosite_hash_max_size (currently %ui)",
+                                   &cats[i].tag, bucket_size, max_size);
                 return NGX_ERROR;
             }
         } else {

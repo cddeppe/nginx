@@ -82,6 +82,15 @@ stream {
     #    categories in the file are loaded.
     geosite_filter amazon hulu disney netflix google;
 
+    # 2b. Optional: tune hash table sizing. Defaults are usually fine,
+    #     but if you see "could not build geosite_domain_hash, you should
+    #     increase geosite_hash_bucket_size" in error.log, bump bucket_size
+    #     (typically double it). Some real geosite categories have entries
+    #     > 80 bytes (long cloudfront / aws subdomains), which is why the
+    #     default is 256 rather than the nginx standard 64.
+    # geosite_hash_bucket_size 256;
+    # geosite_hash_max_size 16384;
+
     # 3. Map SNI → backend (existing logic)
     map $ssl_preread_server_name $target_backend {
         nas.deppe.cc  "$ssl_preread_server_name:3064";
