@@ -35,14 +35,31 @@ fi
 VERSION="$(awk '/^#define NGINX_VERSION/ {gsub(/"/, "", $3); print $3}' \
            "$REPO_ROOT/src/core/nginx.h")"
 GIT_DESCRIBE="$(cd "$REPO_ROOT" && git describe --tags --always --dirty 2>/dev/null || echo "local")"
-PKG_VERSION="${VERSION}+cddeppe1"
-if [[ "$GIT_DESCRIBE" != "local" && "$GIT_DESCRIBE" != "$VERSION" ]]; then
-    # Use git describe as the debian revision
-    PKG_VERSION="${VERSION}+${GIT_DESCRIBE#v}"
+
+# Compute the Debian package version.
+# Strategy: prefer the git tag (when we're on a release tag like v1.31.8+cddeppe1),
+# otherwise fall back to <nginx_version>+<git_describe>.
+#
+# Examples:
+#   git describe = "v1.31.8+cddeppe1"   -> PKG_VERSION = "1.31.8+cddeppe1"
+#   git describe = "v1.31.8+cddeppe1-3-gabcd"  -> "1.31.8+cddeppe1.3.gabcd"
+#   git describe = "local" (no tags)     -> PKG_VERSION = "<nginx_version>+cddeppe1"
+if [[ "$GIT_DESCRIBE" != "local" ]]; then
+    # Strip leading "v"
+    PKG_VERSION="${GIT_DESCRIBE#v}"
+    # Convert "1.31.8+cddeppe1-3-gabcd123-dirty" to "1.31.8+cddeppe1.3.gabcd123.dirty"
+    # Debian version strings can't have "-" (used as separator between version and revision),
+    # so we replace with ".". "+" is OK in the upstream version part.
+    PKG_VERSION="${PKG_VERSION//-/.}"
+else
+    PKG_VERSION="${VERSION}+cddeppe1"
 fi
-# Debian versions can't have + in some places; sanitize
-PKG_VERSION="${PKG_VERSION//+/+}"
-PKG_VERSION="${PKG_VERSION//-/_}"
+
+# Defensive: if for some reason the version still doesn't include the nginx
+# version, prepend it.
+if [[ "$PKG_VERSION" != "$VERSION"* ]]; then
+    PKG_VERSION="${VERSION}+${PKG_VERSION}"
+fi
 
 PKG_NAME="nginx-geosite"
 DEB_NAME="${PKG_NAME}_${PKG_VERSION}_${ARCH}.deb"
@@ -356,13 +373,13 @@ echo ""
 echo "==> Built: $OUT_DIR/$DEB_NAME"
 ls -la "$OUT_DIR/$DEB_NAME"
 
-# Verify
+# Verify (without pipefail killing us on truncated head)
 echo ""
 echo "==> Package info:"
-dpkg-deb --info "$OUT_DIR/$DEB_NAME" | head -20
+dpkg-deb --info "$OUT_DIR/$DEB_NAME" 2>&1 | head -20 || true
 echo ""
 echo "==> Contents (top 20):"
-dpkg-deb -c "$OUT_DIR/$DEB_NAME" | head -20
+dpkg-deb -c "$OUT_DIR/$DEB_NAME" 2>&1 | head -20 || true
 
 # Cleanup
 rm -rf "$WORK_DIR"
