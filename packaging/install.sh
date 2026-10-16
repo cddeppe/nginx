@@ -171,11 +171,46 @@ download_latest_deb() {
 install_deb() {
     local deb_path="$1"
     log "Installing $deb_path (this replaces any stock nginx)"
-    # apt install resolves dependencies and handles Conflicts/Replaces properly.
-    # force_confold_setup() already wrote /etc/apt/apt.conf.d/99nginx-geosite-install
-    # which forces --force-confold globally, so this apt-get install is fully
-    # non-interactive even when upgrading over a modified /etc/nginx/nginx.conf.
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "$deb_path"
+
+    # If nginx-geosite is in a half-configured state, purge it first
+    # (preserving the user's nginx.conf via backup). This avoids the
+    # conffile prompt that happens when dpkg tries to --configure the
+    # broken package as part of the new install.
+    local pkg_state
+    pkg_state=$(dpkg -l nginx-geosite 2>/dev/null | awk '/^i/ {print $1}' | head -1)
+    if [[ "$pkg_state" =~ ^(iF|iU|iH|iW|iT)$ ]]; then
+        log "Existing nginx-geosite is in broken state ($pkg_state) — purging and reinstalling"
+
+        # Backup user's config (purge will remove it)
+        if [[ -f /etc/nginx/nginx.conf ]]; then
+            cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.install-backup
+        fi
+
+        # Purge (force, in case pre-remove scripts are also broken)
+        DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all nginx-geosite 2>&1 | tail -3 || true
+
+        # Restore user's config so the new install sees it as "existing"
+        if [[ -f /etc/nginx/nginx.conf.install-backup ]]; then
+            mkdir -p /etc/nginx
+            cp /etc/nginx/nginx.conf.install-backup /etc/nginx/nginx.conf
+        fi
+    fi
+
+    # Install with dpkg directly, forcing --force-confold at the dpkg level
+    # (not via apt-get, which has its own conffile handling that's flaky).
+    # Then run apt-get install -f to resolve any missing dependencies.
+    DEBIAN_FRONTEND=noninteractive dpkg -i --force-confold --force-confdef --force-depends "$deb_path" 2>&1 | tail -10
+
+    # Fix any missing dependencies
+    if ! dpkg -l nginx-geosite 2>/dev/null | grep -q '^ii'; then
+        log "Resolving dependencies"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -f 2>&1 | tail -5 || true
+    fi
+
+    # Verify install succeeded
+    if ! dpkg -l nginx-geosite 2>/dev/null | grep -q '^ii'; then
+        die "Failed to install nginx-geosite. Check dpkg -l nginx-geosite output."
+    fi
 }
 
 download_geosite() {
