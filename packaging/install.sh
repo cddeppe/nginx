@@ -136,8 +136,14 @@ download_latest_deb() {
 install_deb() {
     local deb_path="$1"
     log "Installing $deb_path (this replaces any stock nginx)"
-    # apt install resolves dependencies and handles Conflicts/Replaces properly
-    apt-get install -y "$deb_path"
+    # apt install resolves dependencies and handles Conflicts/Replaces properly.
+    # Use --force-confold so dpkg doesn't prompt about the modified nginx.conf
+    # (we always want to keep the user's existing config, not overwrite it with
+    # the package's default). This makes the install fully non-interactive.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        -o Dpkg::Options::="--force-confold" \
+        -o Dpkg::Options::="--force-confdef" \
+        "$deb_path"
 }
 
 download_geosite() {
