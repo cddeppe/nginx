@@ -1,0 +1,144 @@
+name: Build and Release
+
+# Build .deb packages for amd64 and arm64 on every tag push (v*), and
+# attach them to a GitHub Release. The user-facing install.sh script
+# then fetches the .deb from "latest release" via the GitHub API.
+#
+# To cut a new release:
+#   git tag v1.31.8+cddeppe1
+#   git push origin v1.31.8+cddeppe1
+#
+# The workflow will:
+#   1. Build on ubuntu-latest (amd64)
+#   2. Build on ubuntu-24.04-arm (arm64)
+#   3. Create a GitHub Release with both .deb files attached
+#
+# The .deb files are named:
+#   nginx-geosite_<version>_amd64.deb
+#   nginx-geosite_<version>_arm64.deb
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name (e.g. v1.31.8+cddeppe1)'
+        required: true
+        default: 'v1.31.8+cddeppe1'
+
+permissions:
+  contents: write   # needed to create the release
+  packages: write
+
+jobs:
+  build:
+    name: Build .deb on ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history for `git describe`
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libpcre2-dev libssl-dev zlib1g-dev \
+            libcap2-bin dpkg-dev git wget curl ca-certificates
+
+      - name: Build .deb
+        run: |
+          chmod +x packaging/build-deb.sh
+          ./packaging/build-deb.sh packaging/out
+
+      - name: Show built artifact
+        run: |
+          ls -la packaging/out/
+          dpkg-deb --info packaging/out/*.deb | head -20
+          dpkg-deb -c packaging/out/*.deb | head -20
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: packaging/out/*.deb
+          retention-days: 30
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine tag name
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "name=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download all .deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: deb-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: nginx-geosite ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          files: |
+            artifacts/*.deb
+          body: |
+            ## nginx-geosite ${{ steps.tag.outputs.name }}
+
+            ### Install (one line)
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/master/packaging/install.sh | sudo bash
+            ```
+
+            ### Install + start immediately
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/master/packaging/install.sh | sudo bash -s -- --start
+            ```
+
+            ### What's new
+            See `git log` since the previous tag.
+
+            ### Packages
+            - `nginx-geosite_${{ steps.tag.outputs.name }}_amd64.deb` — for x86_64 / Intel / AMD servers
+            - `nginx-geosite_${{ steps.tag.outputs.name }}_arm64.deb` — for ARM64 / aarch64 / Apple Silicon / RPi 4+ servers
+
+            ### Manual install (without installer script)
+            ```bash
+            # pick the right .deb for your arch:
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/nginx-geosite_<version>_<arch>.deb
+            sudo apt-get install -y ./nginx-geosite-*.deb
+            ```
+          draft: false
+          prerelease: false
