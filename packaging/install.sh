@@ -48,6 +48,26 @@ require_root() {
     fi
 }
 
+# Detect and recover from a half-configured dpkg state (e.g. previous install
+# aborted by a conffile prompt). Safe to call repeatedly.
+repair_dpkg_state() {
+    # Check if any package is in a half-configured/half-installed state
+    if dpkg -l 2>/dev/null | awk '/^[a-z][a-zA-Z]/ {print $1}' | grep -qE '^(iF|iU|iH|hF|iW|iT|trig|rc)'; then
+        log "Detected half-configured packages — repairing dpkg state"
+        DEBIAN_FRONTEND=noninteractive dpkg --configure -a \
+            -o Dpkg::Options::="--force-confold" \
+            -o Dpkg::Options::="--force-confdef" 2>/dev/null || \
+            DEBIAN_FRONTEND=noninteractive dpkg --configure --force-confold --force-confdef -a
+    fi
+
+    # Specifically check if nginx-geosite is in a broken state
+    if dpkg -l nginx-geosite 2>/dev/null | awk '{print $1}' | grep -qE '^(iF|iU|iH|iW|iT)$'; then
+        log "Repairing nginx-geosite package state"
+        DEBIAN_FRONTEND=noninteractive dpkg --configure nginx-geosite \
+            --force-confold --force-confdef 2>&1 | tail -3 || true
+    fi
+}
+
 detect_arch() {
     local machine
     machine="$(uname -m)"
@@ -259,6 +279,10 @@ main() {
 
     require_root
     log "Installing nginx-geosite"
+
+    # Repair any half-configured dpkg state from a previous broken install
+    # (e.g. a prior run that aborted on a conffile prompt). Safe no-op if clean.
+    repair_dpkg_state
 
     local distro
     distro="$(detect_distro)"
