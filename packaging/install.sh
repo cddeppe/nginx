@@ -87,23 +87,49 @@ download_latest_deb() {
     local arch="$1"
     local out_dir="$2"
     log "Fetching latest release info from GitHub"
-    local release_json
-    release_json="$(curl -fsSL "$GITHUB_API")"
-    if [[ -z "$release_json" ]]; then
-        die "Could not fetch release info from $GITHUB_API"
+
+    local release_json deb_url
+
+    # Try authenticated first (if GH_TOKEN is set in env), then unauthenticated.
+    # Unauthenticated calls are rate-limited to 60/hour per IP — usually fine
+    # for end users, but a CI runner sharing an IP could hit the limit.
+    if [[ -n "${GH_TOKEN:-}" ]]; then
+        release_json="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$GITHUB_API")"
+    else
+        release_json="$(curl -fsSL "$GITHUB_API" 2>/dev/null || true)"
     fi
 
-    # Extract .deb URL for this arch
-    local deb_url
-    deb_url="$(echo "$release_json" | grep -oE "https://[^\"']*_${arch}\.deb" | head -1)"
-    if [[ -z "$deb_url" ]]; then
-        die "No .deb found for arch=$arch in latest release. Check https://github.com/$GITHUB_REPO/releases"
+    if [[ -z "$release_json" ]]; then
+        # Fallback: try to derive the URL from the latest tag without API.
+        # This works because GitHub release asset URLs follow a predictable pattern:
+        #   https://github.com/<repo>/releases/download/<tag>/<asset_name>
+        # We scrape the latest tag from the HTML page (no rate limit on HTML).
+        warn "GitHub API call failed (rate-limited?), trying HTML scrape fallback"
+        local latest_tag
+        latest_tag="$(curl -fsSL "https://github.com/$GITHUB_REPO/releases/latest" \
+                       -o /dev/null -w '%{url_effective}' | \
+                       sed 's|.*/tag/||; s|%2B|+|g')"
+        if [[ -z "$latest_tag" || "$latest_tag" == "https://github.com/$GITHUB_REPO/releases" ]]; then
+            die "Could not determine latest release tag. Check https://github.com/$GITHUB_REPO/releases"
+        fi
+        log "Latest tag (via HTML): $latest_tag"
+        deb_url="https://github.com/$GITHUB_REPO/releases/download/$latest_tag/nginx-geosite_${latest_tag#v}_${arch}.deb"
+    else
+        # Extract .deb URL for this arch from the JSON.
+        # The URL contains URL-encoded '+' as '%2B' — keep it as-is, wget handles it.
+        deb_url="$(echo "$release_json" | grep -oE "https://[^\"]*_${arch}\.deb" | head -1)"
+        if [[ -z "$deb_url" ]]; then
+            die "No .deb found for arch=$arch in latest release. Check https://github.com/$GITHUB_REPO/releases"
+        fi
     fi
 
     local deb_name
     deb_name="$(basename "$deb_url")"
+    # Decode %2B → + for the local filename (cosmetic)
+    deb_name="${deb_name//%2B/+}"
     log "Downloading $deb_name"
-    wget -q -O "$out_dir/$deb_name" "$deb_url"
+    wget -q -O "$out_dir/$deb_name" "$deb_url" || \
+        die "Failed to download $deb_url"
     echo "$out_dir/$deb_name"
 }
 
