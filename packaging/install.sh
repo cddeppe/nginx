@@ -37,7 +37,7 @@ GEOSITE_PATH="/usr/local/etc/xray/domains/dlc.dat"
 # Helpers
 # ---------------------------------------------------------------------------
 
-log()  { echo -e "\033[1;34m==>\033[0m $*"; }
+log()  { echo -e "\033[1;34m==>\033[0m $*" >&2; }
 warn() { echo -e "\033[1;33mWARN:\033[0m $*" >&2; }
 err()  { echo -e "\033[1;31mERROR:\033[0m $*" >&2; }
 die()  { err "$*"; exit 1; }
