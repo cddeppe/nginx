@@ -248,6 +248,37 @@ enable_service() {
     systemctl daemon-reload 2>/dev/null || true
 }
 
+# Detect if nginx is currently running (so we know whether to auto-restart
+# after upgrade). Must be called BEFORE install_deb, because install_deb
+# might purge + reinstall which would briefly stop nginx.
+was_nginx_running() {
+    systemctl is-active --quiet nginx.service 2>/dev/null
+}
+
+# After install_deb, if nginx was running before, restart it to pick up
+# the new binary. systemctl reload only re-reads config — it does NOT
+# replace the running binary. Only restart swaps in the new binary.
+# This is critical for upgrades: the user runs install.sh expecting the
+# new features to take effect, but without a restart they don't.
+restart_service_if_was_running() {
+    if was_nginx_running; then
+        log "nginx was running before upgrade — restarting to load new binary"
+        # Test config first; if it fails, don't restart (would leave nginx down)
+        if /usr/sbin/nginx -t -q -c /etc/nginx/nginx.conf 2>/dev/null; then
+            if systemctl restart nginx.service; then
+                log "nginx restarted with new binary"
+                systemctl status nginx.service --no-pager -l 2>/dev/null | head -5 || true
+            else
+                warn "nginx restart failed — check journalctl -u nginx"
+                warn "the new binary is installed but the old one is still running"
+            fi
+        else
+            warn "nginx -t failed — NOT restarting (would leave service down)"
+            warn "fix /etc/nginx/nginx.conf then run: sudo systemctl restart nginx"
+        fi
+    fi
+}
+
 start_service() {
     log "Starting nginx.service"
     if systemctl start nginx.service; then
@@ -350,6 +381,13 @@ main() {
 
     install_deps
 
+    # Snapshot whether nginx is currently running, BEFORE install_deb.
+    # If it is, we'll auto-restart after install to pick up the new binary.
+    local was_running=0
+    if was_nginx_running; then
+        was_running=1
+    fi
+
     local tmp_dir
     tmp_dir="$(mktemp -d)"
     trap "rm -rf '$tmp_dir'; force_confold_cleanup" EXIT
@@ -362,15 +400,25 @@ main() {
     ensure_cron
     enable_service
 
-    if [[ $do_start -eq 1 ]]; then
+    # If nginx was running before the upgrade, restart it to load the new
+    # binary. systemctl reload is NOT enough — it only re-reads config.
+    # This is the fix for the issue where users had to manually restart
+    # after running install.sh to get new features (e.g. resolver interface=).
+    if [[ $was_running -eq 1 ]]; then
+        restart_service_if_was_running
+    fi
+
+    # If user passed --start, ensure it's started (covers fresh install case
+    # where was_running=0 and they want it running now).
+    if [[ $do_start -eq 1 ]] && ! was_nginx_running; then
         start_service
     fi
 
     print_next_steps
 
-    if [[ $do_start -eq 0 ]]; then
-        log "Service NOT started automatically — edit /etc/nginx/nginx.conf first,"
-        log "then run: systemctl start nginx"
+    if [[ $was_running -eq 0 ]] && [[ $do_start -eq 0 ]]; then
+        log "Service NOT started — edit /etc/nginx/nginx.conf first,"
+        log "then run: sudo systemctl start nginx"
         log "(Re-run with --start to skip this gate.)"
     fi
 }
