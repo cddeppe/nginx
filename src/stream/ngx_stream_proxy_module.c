@@ -25,10 +25,12 @@ typedef struct {
     ngx_msec_t                       next_upstream_timeout;
     size_t                           buffer_size;
     /*
-     * Upper bound for adaptive per-direction buffer growth (0 = off,
+     * Upper bound for adaptive per-direction buffer sizing (0 = off,
      * the default). When set above proxy_buffer_size, a direction whose
      * reads keep filling its buffer completely has the buffer grown in
-     * x4 steps up to this size, after the pending data fully drains.
+     * x4 steps up to this size, and a direction whose reads stay tiny
+     * has it shrunk back toward proxy_buffer_size, in each case only
+     * after the pending data fully drains.
      */
     size_t                           buffer_max_size;
     ngx_stream_complex_value_t      *upload_rate;
@@ -1964,22 +1966,47 @@ ngx_stream_proxy_test_connect(ngx_connection_t *c)
 }
 
 
+typedef struct {
+    ngx_buf_t  *b;
+    u_char     *base;
+} ngx_stream_proxy_buf_cleanup_t;
+
+
+static void
+ngx_stream_proxy_buf_cleanup(void *data)
+{
+    ngx_stream_proxy_buf_cleanup_t *bc = data;
+
+    /*
+     * Free the heap block the buffer sits on, if any.  Once the
+     * buffer has been shrunk back onto the original pool block
+     * (bc->b->start == bc->base) there is nothing to free here;
+     * the pool block is released together with the pool.
+     */
+    if (bc->b->start != bc->base) {
+        ngx_free(bc->b->start);
+    }
+}
+
+
 static void
 ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
     ngx_uint_t do_write)
 {
     char                         *recv_action, *send_action;
-    u_char                       *p;
+    u_char                       *p, **base;
     off_t                        *received, limit;
     size_t                        size, limit_rate;
     ssize_t                       n;
     ngx_buf_t                    *b;
     ngx_int_t                     rc;
-    ngx_uint_t                    flags, *packets, *fill;
+    ngx_uint_t                    flags, *packets, *fill, *slack;
     ngx_msec_t                    delay;
     ngx_chain_t                  *cl, **ll, **out, **busy;
     ngx_connection_t             *c, *pc, *src, *dst;
     ngx_log_handler_pt            handler;
+    ngx_pool_cleanup_t           *cln;
+    ngx_stream_proxy_buf_cleanup_t *bc;
     ngx_stream_upstream_t        *u;
     ngx_stream_proxy_srv_conf_t  *pscf;
 
@@ -2013,6 +2040,8 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
         received = &u->received;
         packets = &u->responses;
         fill = &u->upstream_fill;
+        slack = &u->upstream_slack;
+        base = &u->upstream_base;
         out = &u->downstream_out;
         busy = &u->downstream_busy;
         recv_action = "proxying and reading from upstream";
@@ -2026,6 +2055,8 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
         received = &s->received;
         packets = &u->requests;
         fill = &u->downstream_fill;
+        slack = &u->downstream_slack;
+        base = &u->downstream_base;
         out = &u->upstream_out;
         busy = &u->upstream_busy;
         recv_action = "proxying and reading from client";
@@ -2054,14 +2085,29 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
                     b->last = b->start;
 
                     /*
-                     * Adaptive growth: this direction's buffer has
-                     * fully drained, and the reader filled it to the
-                     * brim three times in a row. Grow in x4 steps,
-                     * capped by proxy_buffer_max_size. The swap is safe
-                     * here: *out was consumed and *busy is empty, so no
-                     * chain still references b. The replaced block
-                     * stays in the connection pool until the session
-                     * ends (worst case ~1.3x the final size held).
+                     * Adaptive sizing.  The swap point is safe:
+                     * *out was consumed and *busy is empty, so no
+                     * chain still references b, and the buffer is
+                     * empty (pos == last == start).
+                     *
+                     * Growth: three consecutive full fills mean the
+                     * flow is throughput-bound - grow in x4 steps,
+                     * capped by proxy_buffer_max_size.  Blocks beyond
+                     * the initial one come from ngx_alloc() and the
+                     * block they replace is freed right here, so a
+                     * grown buffer costs its current size, not the
+                     * sum of every size it passed through.  The
+                     * original pool block is kept for reuse when the
+                     * direction later shrinks all the way back.
+                     *
+                     * Shrink: 32 consecutive reads below 1/16 of the
+                     * buffer mean the flow has slowed to a trickle -
+                     * step back down, restoring the original pool
+                     * block (with no allocation) once the target is
+                     * proxy_buffer_size.  The shrink trigger is an
+                     * order of magnitude more conservative than the
+                     * growth trigger (32 tiny reads vs 3 full fills)
+                     * so an oscillating flow does not cause churn.
                      */
                     if (pscf->buffer_max_size > (size_t) (b->end - b->start)
                         && *fill >= 3)
@@ -2072,20 +2118,96 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
                             size = pscf->buffer_max_size;
                         }
 
-                        p = ngx_pnalloc(c->pool, size);
+                        p = ngx_alloc(size, c->log);
 
                         if (p != NULL) {
-                            b->start = p;
-                            b->end = p + size;
-                            b->pos = p;
-                            b->last = p;
 
-                            ngx_log_error(NGX_LOG_INFO, c->log, 0,
-                                          "stream proxy buffer grown to %uz "
-                                          "bytes", size);
+                            if (*base == NULL) {
+                                cln = ngx_pool_cleanup_add(c->pool,
+                                          sizeof(ngx_stream_proxy_buf_cleanup_t));
+
+                                if (cln != NULL) {
+                                    bc = cln->data;
+                                    bc->b = b;
+                                    bc->base = b->start;
+                                    cln->handler = ngx_stream_proxy_buf_cleanup;
+
+                                    *base = b->start;
+
+                                } else {
+                                    /*
+                                     * Cannot guarantee the free at
+                                     * session end - keep the pool block
+                                     * and stay at the current size.
+                                     */
+                                    ngx_free(p);
+                                    p = NULL;
+                                }
+                            }
+
+                            if (p != NULL) {
+                                if (b->start != *base) {
+                                    ngx_free(b->start);
+                                }
+
+                                b->start = p;
+                                b->end = p + size;
+                                b->pos = p;
+                                b->last = p;
+
+                                ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                                              "stream proxy buffer grown "
+                                              "to %uz bytes", size);
+                            }
                         }
 
                         *fill = 0;
+                        *slack = 0;
+
+                    } else if (*base != NULL && *slack >= 32
+                               && (size_t) (b->end - b->start)
+                                  > pscf->buffer_size)
+                    {
+                        size = (size_t) (b->end - b->start) / 4;
+
+                        if (size < pscf->buffer_size) {
+                            size = pscf->buffer_size;
+                        }
+
+                        if (size == pscf->buffer_size) {
+
+                            /* back onto the original pool block */
+
+                            ngx_free(b->start);
+
+                            b->start = *base;
+                            b->end = *base + pscf->buffer_size;
+                            b->pos = b->start;
+                            b->last = b->start;
+
+                            ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                                          "stream proxy buffer shrunk "
+                                          "to %uz bytes", size);
+
+                        } else {
+                            p = ngx_alloc(size, c->log);
+
+                            if (p != NULL) {
+                                ngx_free(b->start);
+
+                                b->start = p;
+                                b->end = p + size;
+                                b->pos = p;
+                                b->last = p;
+
+                                ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                                              "stream proxy buffer shrunk "
+                                              "to %uz bytes", size);
+                            }
+                        }
+
+                        *fill = 0;
+                        *slack = 0;
                     }
                 }
             }
@@ -2170,18 +2292,32 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
                 b->last += n;
 
                 /*
-                 * Track whether this read filled the buffer completely:
-                 * a sustained streak of full fills means the reader is
-                 * delivering more per event than the buffer can hold -
-                 * the connection is throughput-bound. Only maintained
-                 * for TCP sessions (a UDP "buffer" must hold one max
-                 * datagram; growing it on datagram fills is wrong).
+                 * Track how the read size compares to the buffer:
+                 * - a sustained streak of full fills means the reader
+                 *   is delivering more per event than the buffer can
+                 *   hold - the connection is throughput-bound and the
+                 *   buffer is a grow candidate;
+                 * - a sustained streak of tiny reads (below 1/16 of
+                 *   the buffer) means the buffer is oversized for the
+                 *   flow as it stands now - a shrink candidate;
+                 * - anything in between clears both signals.
+                 * Only maintained for TCP sessions (a UDP "buffer"
+                 * must hold one max datagram; resizing it is wrong).
                  */
                 if (pscf->buffer_max_size && c->type == SOCK_STREAM) {
                     if (b->last == b->end) {
                         (*fill)++;
+                        *slack = 0;
+
+                    } else if ((size_t) n
+                               < (size_t) (b->end - b->start) / 16)
+                    {
+                        (*slack)++;
+                        *fill = 0;
+
                     } else {
                         *fill = 0;
+                        *slack = 0;
                     }
                 }
 

@@ -141,6 +141,10 @@ typedef struct {
     ngx_uint_t                         responses;
     ngx_uint_t                         upstream_fill;    /* full-read streak, up direction */
     ngx_uint_t                         downstream_fill;  /* full-read streak, down direction */
+    ngx_uint_t                         upstream_slack;   /* tiny-read streak, up direction */
+    ngx_uint_t                         downstream_slack; /* tiny-read streak, down direction */
+    u_char                            *upstream_base;    /* original pool block, up direction */
+    u_char                            *downstream_base;  /* original pool block, down direction */
     ngx_msec_t                         start_time;
 
     size_t                             upload_rate;
