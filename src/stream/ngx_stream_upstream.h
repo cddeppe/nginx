@@ -161,6 +161,7 @@ typedef struct {
     int                               pipe_c2u[2];
     int                               pipe_u2c[2];
     unsigned                          splice_active:1;
+    unsigned                          splice_preread_done:1; /* preread flushed */
 #endif
 } ngx_stream_upstream_t;
 

@@ -2090,25 +2090,33 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
             pipe = from_upstream ? u->pipe_u2c : u->pipe_c2u;
 
             /*
-             * CRITICAL: Check for pending data in the buffer chain.
+             * CRITICAL: Handle ssl_preread buffer correctly.
              *
              * When ssl_preread on; is used, the TLS ClientHello is stored
-             * in the *out chain (u->upstream_out for client→upstream, or
-             * u->downstream_out for upstream→client). This data was read
-             * into userspace by the ssl_preread module and MUST be sent
-             * via the normal buffer path (recv/send), NOT splice.
+             * in the *out chain. This must be sent via the normal buffer
+             * path (send()), NOT splice.
              *
-             * If we enter the splice path while *out or *busy has data,
-             * the preread bytes get lost — the TLS handshake fails, and
-             * connections through WireGuard tunnels break.
+             * We use a per-connection flag (splice_preread_done) to track
+             * whether the preread data has been flushed:
              *
-             * Solution: if *out or *busy is non-NULL, fall through to the
-             * normal buffer path. Once the chains are empty (all preread
-             * data has been sent), splice takes over for all subsequent
-             * data.
+             * - splice_preread_done=0 (initial): check out/busy chains. If they
+             *   have data, fall through to normal path to flush. Once empty,
+             *   set splice_preread_done=1 and proceed with splice.
+             *
+             * - splice_preread_done=1: always use splice. Never fall through.
+             *   This is the steady-state. Splice handles ALL data, and the
+             *   normal buffer path's read code is never reached.
+             *
+             * Without this flag, the normal path reads new data into *out
+             * on every iteration, and splice always sees *out != NULL and
+             * falls through. Splice never actually runs.
              */
-            if (*out != NULL || *busy != NULL) {
-                goto splice_fallback;  /* use normal buffer path */
+            if (!u->splice_preread_done) {
+                if (*out != NULL || *busy != NULL) {
+                    goto splice_fallback;  /* flush preread via normal path */
+                }
+                /* Preread data flushed — splice takes over from here */
+                u->splice_preread_done = 1;
             }
 
             /*
@@ -2166,7 +2174,7 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
 
                 c->log->action = recv_action;
 
-                n = splice(src->fd, NULL, pipe[1], NULL, 65536,
+                n = splice(src->fd, NULL, pipe[1], NULL, 1048576,
                            SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
 
                 if (n == -1) {
