@@ -161,9 +161,13 @@ if [[ ! -f "$PKG_ROOT/etc/nginx/nginx.conf" ]] && [[ -f "$REPO_ROOT/packaging/ng
     cp "$REPO_ROOT/packaging/nginx.conf.example" "$PKG_ROOT/etc/nginx/nginx.conf"
 fi
 
-# systemd unit
+# systemd unit — install to both /etc/systemd/system (active location) and
+# /usr/share/doc/nginx-geosite/ (canonical source for install.sh to copy
+# from on upgrade, in case dpkg didn't replace the active one)
 cp "$REPO_ROOT/packaging/nginx.service" "$PKG_ROOT/etc/systemd/system/nginx.service"
 chmod 644 "$PKG_ROOT/etc/systemd/system/nginx.service"
+cp "$REPO_ROOT/packaging/nginx.service" "$PKG_ROOT/usr/share/doc/nginx-geosite/nginx.service"
+chmod 644 "$PKG_ROOT/usr/share/doc/nginx-geosite/nginx.service"
 
 # cron weekly refresh of dlc.dat
 cp "$REPO_ROOT/packaging/refresh-geosite" "$PKG_ROOT/etc/cron.weekly/refresh-geosite"

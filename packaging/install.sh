@@ -54,8 +54,9 @@ repair_dpkg_state() {
     # Check if any package is in a half-configured/half-installed state
     # Status codes: iF=half-conf, iU=unpacked, iH=half-inst, iW=awaiting trigger,
     #               iT=trigger-pending, trig=trigger-awaiting
+    # Use awk to count directly (avoids the newline issue with command substitution)
     local broken
-    broken=$(dpkg -l 2>/dev/null | awk '/^[a-z][a-zA-Z]/ {print $1}' | grep -cE '^(iF|iU|iH|iW|iT)$' || echo 0)
+    broken=$(dpkg -l 2>/dev/null | awk '/^(iF|iU|iH|iW|iT)/ {count++} END {print count+0}')
 
     if [[ "$broken" -gt 0 ]]; then
         log "Detected $broken half-configured package(s) — repairing dpkg state"
@@ -244,8 +245,19 @@ ensure_cron() {
 
 enable_service() {
     log "Enabling nginx.service (will start on boot)"
-    systemctl enable nginx.service 2>/dev/null || true
+
+    # Force-overwrite the systemd unit file with the canonical version from
+    # the package. The .deb install sometimes doesn't replace an existing
+    # unit file (dpkg doesn't treat /etc/systemd/system/*.service as a
+    # conffile, but in practice the file can be left unchanged if the
+    # content is identical OR if a previous version left a stale one).
+    # This ensures we always have the latest unit file with all fixes.
+    if [[ -f /usr/share/doc/nginx-geosite/nginx.service ]]; then
+        cp /usr/share/doc/nginx-geosite/nginx.service /etc/systemd/system/nginx.service
+    fi
+
     systemctl daemon-reload 2>/dev/null || true
+    systemctl enable nginx.service 2>/dev/null || true
 }
 
 # Detect if nginx is currently running (so we know whether to auto-restart
