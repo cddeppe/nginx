@@ -78,10 +78,24 @@ Dpkg::Options {
 };
 APT::Get::Assume-Yes "true";
 CONF
+
+    # Disable needrestart during install — it tries to restart services
+    # after apt-get install, and can stop nginx without restarting it
+    # (race condition with our own service management). We handle nginx
+    # restart ourselves; needrestart just gets in the way.
+    cat > /etc/apt/apt.conf.d/99nginx-geosite-needrestart <<'CONF'
+NeedRestart::Services "\$nrconf{needrestart} = 'n';";
+NeedRestart::Verbosity 0;
+CONF
+
+    # Also set environment variable for needrestart (belt and suspenders)
+    export NEEDRESTART_SUSPEND=1
+    export NEEDRESTART_MODE=n
 }
 
 force_confold_cleanup() {
     rm -f /etc/apt/apt.conf.d/99nginx-geosite-install
+    rm -f /etc/apt/apt.conf.d/99nginx-geosite-needrestart
 }
 
 detect_arch() {
@@ -457,15 +471,27 @@ main() {
 
     print_next_steps
 
-    # Print the "edit config then start" gate message ONLY for true fresh
-    # installs where nginx -t failed (config is the package default, user
-    # probably needs to customize it). For upgrades where nginx started
-    # successfully, no message needed.
+    # FINAL CHECK: verify nginx is actually running. needrestart, apt-daily,
+    # or other apt hooks may have stopped it after our start. If it's down
+    # and config is valid, start it one more time. This is the last resort
+    # to ensure install.sh leaves nginx in a running state.
     if ! was_nginx_running; then
-        if ! /usr/sbin/nginx -t -q -c /etc/nginx/nginx.conf 2>/dev/null; then
+        if /usr/sbin/nginx -t -q -c /etc/nginx/nginx.conf 2>/dev/null; then
+            log "Final check: nginx not running — starting it"
+            systemctl start nginx.service 2>/dev/null || true
+            sleep 2
+            if was_nginx_running; then
+                log "nginx is now running"
+            else
+                warn "nginx still not running after final check"
+                warn "Manual recovery: sudo systemctl start nginx"
+            fi
+        else
             log "Service NOT started — nginx -t failed."
             log "Edit /etc/nginx/nginx.conf, then run: sudo systemctl start nginx"
         fi
+    else
+        log "nginx is running — install complete"
     fi
 }
 
