@@ -294,6 +294,13 @@ ngx_resolver_create(ngx_conf_t *cf, ngx_str_t *names, ngx_uint_t n)
             s.len = names[i].len - 10;
             s.data = names[i].data + 10;
 
+            if (r->interface_len != 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "duplicate interface= parameter in "
+                                   "\"resolver\"");
+                return NULL;
+            }
+
             if (s.len == 0 || s.len >= 16) {  /* IFNAMSIZ = 16 */
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                    "invalid interface name in \"%V\"",
