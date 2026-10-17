@@ -263,7 +263,14 @@ ngx_pb_read_len(u_char **p, u_char *end, size_t *len)
     ngx_uint_t  n;
 
     n = ngx_pb_read_varint(p, end);
-    if (*p + n > end) {
+
+    /*
+     * Compare as a count, never as a pointer: "*p + n" can wrap around
+     * on 64-bit lengths (a 10-byte varint encodes up to 2^64-1), pass
+     * the "> end" test, and hand the caller a start pointer below the
+     * buffer - which then parses pool memory as file content.
+     */
+    if (n > (ngx_uint_t) (end - *p)) {
         return NULL;
     }
     *len = (size_t) n;
