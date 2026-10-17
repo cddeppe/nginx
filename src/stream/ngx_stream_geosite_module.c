@@ -961,6 +961,10 @@ ngx_stream_geosite_variable(ngx_stream_session_t *s,
     cats = gmcf->categories->elts;
     n = gmcf->categories->nelts;
 
+    ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
+                  "geosite: matching SNI=\"%V\" against %ui categories",
+                  &sni, n);
+
     /*
      * For each category, check:
      *   1. Exact match in full_hash (sni == key)
@@ -969,6 +973,11 @@ ngx_stream_geosite_variable(ngx_stream_session_t *s,
      */
     for (i = 0; i < n; i++) {
         cat = &cats[i];
+
+        ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
+                      "geosite: checking cat[%ui]=\"%V\" full_size=%ui domain_size=%ui plain_nelts=%ui",
+                      i, &cat->tag, cat->full_hash.size, cat->domain_hash.size,
+                      cat->plain_array.nelts);
 
         /* (1) full match */
         if (cat->full_hash.size > 0) {
@@ -981,6 +990,10 @@ ngx_stream_geosite_variable(ngx_stream_session_t *s,
                 v->valid = 1;
                 v->no_cacheable = 1;
                 v->not_found = 0;
+
+                ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
+                              "geosite: FULL MATCH: SNI=\"%V\" -> category=\"%V\"",
+                              &sni, &cat->tag);
                 return NGX_OK;
             }
         }
@@ -993,6 +1006,10 @@ ngx_stream_geosite_variable(ngx_stream_session_t *s,
                 suffix.data = p;
                 suffix.len = end - p;
 
+                ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
+                              "geosite: trying suffix=\"%V\" in domain_hash of \"%V\"",
+                              &suffix, &cat->tag);
+
                 if (ngx_hash_find(&cat->domain_hash,
                                   ngx_hash_key_lc(suffix.data, suffix.len),
                                   suffix.data, suffix.len) != NULL)
@@ -1002,6 +1019,10 @@ ngx_stream_geosite_variable(ngx_stream_session_t *s,
                     v->valid = 1;
                     v->no_cacheable = 1;
                     v->not_found = 0;
+
+                    ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
+                                  "geosite: DOMAIN MATCH: SNI=\"%V\" suffix=\"%V\" -> category=\"%V\"",
+                                  &sni, &suffix, &cat->tag);
                     return NGX_OK;
                 }
 
@@ -1023,11 +1044,19 @@ ngx_stream_geosite_variable(ngx_stream_session_t *s,
                     v->valid = 1;
                     v->no_cacheable = 1;
                     v->not_found = 0;
+
+                    ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
+                                  "geosite: PLAIN MATCH: SNI=\"%V\" -> category=\"%V\"",
+                                  &sni, &cat->tag);
                     return NGX_OK;
                 }
             }
         }
     }
+
+    ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
+                  "geosite: NO MATCH for SNI=\"%V\" (tried %ui categories)",
+                  &sni, n);
 
     v->not_found = 1;
     return NGX_OK;
