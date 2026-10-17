@@ -11,7 +11,7 @@
 
 #if (NGX_LINUX)
 #include <fcntl.h>          /* fcntl, F_SETPIPE_SZ */
-#include <sys/stat.h>       /* fstat */
+#include <sys/ioctl.h>      /* ioctl, FIONREAD */
 #endif
 
 
@@ -2072,77 +2072,166 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
 
 #if (NGX_LINUX)
         /* === Splice (zero-copy) path ===
+         *
          * When proxy_splice on; is active, bypass the userspace buffer
          * entirely. Data flows: src socket → kernel pipe → dst socket.
-         * No memcpy, no buffer management, no filter chain.
+         *
+         * CRITICAL: This path handles BOTH read events (src has data)
+         * AND write events (dst became writable). On a write event, we
+         * must first drain any pending data left in the pipe from a
+         * previous EAGAIN on dst. Without this drain-on-write, data
+         * gets stuck in the pipe and video playback stutters.
          */
-        if (u->splice_active && dst && src->read->ready && !src->read->delayed) {
+        if (u->splice_active && dst) {
 
-            int  *pipe;  /* pipe for this direction */
+            int   *pipe;
+            int    pending;
 
             pipe = from_upstream ? u->pipe_u2c : u->pipe_c2u;
 
-            c->log->action = recv_action;
-
-            /* Step 1: splice from source socket into pipe write end */
-            n = splice(src->fd, NULL, pipe[1], NULL, 65536,
-                       SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
-
-            if (n == -1) {
-                if (ngx_socket_errno == NGX_EAGAIN) {
-                    break;  /* source has no data right now */
+            /*
+             * Step 1: Drain pending data from pipe → dst.
+             *
+             * This runs on EVERY event (read or write). If a previous
+             * iteration left data in the pipe because dst was full
+             * (EAGAIN), we MUST drain it now. On a write event, this
+             * is the ONLY thing we do — src may have no new data, but
+             * the pipe still has pending bytes that dst can now accept.
+             */
+            for ( ;; ) {
+                pending = 0;
+                if (ioctl(pipe[0], FIONREAD, &pending) == -1 || pending == 0) {
+                    break;  /* pipe is empty */
                 }
-                if (ngx_socket_errno == NGX_EINTR) {
-                    continue;
-                }
-                /* Real error — treat as EOF */
-                src->read->eof = 1;
-                n = 0;
-            }
 
-            if (n == 0) {
-                src->read->eof = 1;
-            }
+                c->log->action = send_action;
 
-            if (n > 0) {
-                *received += n;
-                (*packets)++;
+                n = splice(pipe[0], NULL, dst->fd, NULL, pending,
+                           SPLICE_F_MOVE | SPLICE_F_MORE | SPLICE_F_NONBLOCK);
 
-                if (from_upstream) {
-                    if (u->state->first_byte_time == (ngx_msec_t) -1) {
-                        u->state->first_byte_time = ngx_current_msec
-                                                    - u->start_time;
+                if (n == -1) {
+                    if (ngx_socket_errno == NGX_EAGAIN) {
+                        /* dst still full — can't drain, wait for next write event */
+                        goto splice_done;
                     }
+                    if (ngx_socket_errno == NGX_EINTR) {
+                        continue;
+                    }
+                    ngx_connection_error(c, ngx_socket_errno,
+                                         "splice() drain to dst failed");
+                    ngx_stream_proxy_finalize(s,
+                                              NGX_STREAM_INTERNAL_SERVER_ERROR);
+                    return;
                 }
 
-                /* Step 2: splice from pipe read end to destination socket */
-                ssize_t  written = 0;
-                while (written < n) {
-                    ssize_t  sn;
-                    sn = splice(pipe[0], NULL, dst->fd, NULL, n - written,
-                               SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+                if (n == 0) {
+                    break;  /* pipe drained */
+                }
 
-                    if (sn == -1) {
-                        if (ngx_socket_errno == NGX_EAGAIN) {
-                            /* Destination not writable — data stays in pipe.
-                             * It will be drained on the next writable event.
-                             * The pipe buffer (1MB) can hold plenty of data. */
+                /* n bytes drained from pipe to dst.
+                 * Loop back to check if there's more pending. */
+            }
+
+            /*
+             * Step 2: Read new data from src → pipe → dst.
+             *
+             * Only do this if src actually has data (read event).
+             * On a pure write event, src->read->ready is false, so
+             * we skip this and just exit — the drain above was the
+             * only thing needed.
+             */
+            if (src->read->ready && !src->read->delayed) {
+
+                c->log->action = recv_action;
+
+                n = splice(src->fd, NULL, pipe[1], NULL, 65536,
+                           SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+
+                if (n == -1) {
+                    if (ngx_socket_errno == NGX_EAGAIN) {
+                        goto splice_done;  /* src has no data right now */
+                    }
+                    if (ngx_socket_errno == NGX_EINTR) {
+                        continue;
+                    }
+                    /* Real error — treat as EOF */
+                    src->read->eof = 1;
+                    n = 0;
+                }
+
+                if (n == 0) {
+                    src->read->eof = 1;
+                }
+
+                if (n > 0) {
+                    *received += n;
+                    (*packets)++;
+
+                    if (from_upstream) {
+                        if (u->state->first_byte_time == (ngx_msec_t) -1) {
+                            u->state->first_byte_time = ngx_current_msec
+                                                        - u->start_time;
+                        }
+                    }
+
+                    /*
+                     * Step 3: Move data from pipe → dst.
+                     *
+                     * Try to send everything we just read. If dst
+                     * returns EAGAIN, the remaining data stays in the
+                     * pipe (kernel pipe buffer = 1MB). It will be
+                     * drained on the next write event (Step 1 above).
+                     *
+                     * SPLICE_F_MORE tells the kernel: "there's more
+                     * data coming, coalesce TCP segments." This
+                     * improves throughput for streaming.
+                     */
+                    c->log->action = send_action;
+
+                    ssize_t  total = n;
+                    ssize_t  written = 0;
+
+                    while (written < total) {
+                        ssize_t  sn;
+
+                        sn = splice(pipe[0], NULL, dst->fd, NULL,
+                                    total - written,
+                                    SPLICE_F_MOVE | SPLICE_F_MORE
+                                    | SPLICE_F_NONBLOCK);
+
+                        if (sn == -1) {
+                            if (ngx_socket_errno == NGX_EAGAIN) {
+                                /* dst full — data stays in pipe.
+                                 * Will be drained on next write event. */
+                                break;
+                            }
+                            if (ngx_socket_errno == NGX_EINTR) {
+                                continue;
+                            }
+                            ngx_connection_error(c, ngx_socket_errno,
+                                                 "splice() to dst failed");
+                            ngx_stream_proxy_finalize(s,
+                                                NGX_STREAM_INTERNAL_SERVER_ERROR);
+                            return;
+                        }
+
+                        if (sn == 0) {
                             break;
                         }
-                        if (ngx_socket_errno == NGX_EINTR) {
-                            continue;
-                        }
-                        ngx_connection_error(c, ngx_socket_errno,
-                                             "splice() to destination failed");
-                        ngx_stream_proxy_finalize(s,
-                                                  NGX_STREAM_INTERNAL_SERVER_ERROR);
-                        return;
-                    }
-                    written += sn;
-                }
 
-                do_write = 1;
-                continue;
+                        written += sn;
+                    }
+
+                    /* If we wrote everything, loop to read more from src.
+                     * If dst was full (partial write), data is in the pipe.
+                     * Break out — next write event will drain it (Step 1). */
+                    if (written == total) {
+                        continue;  /* try reading more from src */
+                    }
+
+                    /* Partial write — dst is full. Wait for write event. */
+                    goto splice_done;
+                }
             }
 
             /* EOF on source */
@@ -2154,6 +2243,7 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
                 }
             }
 
+        splice_done:
             break;
         }
 #endif
