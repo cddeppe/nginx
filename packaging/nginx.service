@@ -1,7 +1,7 @@
 [Unit]
 Description=nginx (cddeppe fork — geosite + proxy_interface)
 Documentation=https://github.com/cddeppe/nginx/blob/master/GEOSITE.md
-After=network.target network-online.target remote-fs.target
+After=network-online.target network.target remote-fs.target
 Wants=network-online.target
 
 [Service]
@@ -29,6 +29,16 @@ TimeoutStartSec=30
 TimeoutStopSec=10
 KillMode=process
 KillSignal=QUIT
+
+# Restart on failure — covers boot race condition where secondary IPs
+# (especially on Oracle/AWS cloud instances) aren't bound yet when nginx
+# starts. systemd retries every 2s for up to 30s, by which time cloud-init
+# has assigned all IPs. Without this, users have to manually restart nginx
+# after every reboot.
+Restart=on-failure
+RestartSec=2s
+StartLimitBurst=10
+StartLimitIntervalSec=30
 
 [Install]
 WantedBy=multi-user.target
