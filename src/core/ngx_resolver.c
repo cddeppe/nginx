@@ -264,6 +264,24 @@ ngx_resolver_create(ngx_conf_t *cf, ngx_str_t *names, ngx_uint_t n)
 
             continue;
         }
+
+        /*
+         * prefer_ipv6=on — return AAAA records before A records, so nginx
+         * tries IPv6 upstreams first. Falls back to IPv4 if IPv6 connect
+         * fails. No-op if ipv6=off.
+         */
+        if (ngx_strncmp(names[i].data, "prefer_ipv6=", 12) == 0) {
+            if (ngx_strcmp(&names[i].data[12], "on") == 0) {
+                r->prefer_ipv6 = 1;
+            } else if (ngx_strcmp(&names[i].data[12], "off") == 0) {
+                r->prefer_ipv6 = 0;
+            } else {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "invalid parameter: %V", &names[i]);
+                return NULL;
+            }
+            continue;
+        }
 #endif
 
         /*
@@ -4278,6 +4296,62 @@ ngx_resolver_export(ngx_resolver_t *r, ngx_resolver_node_t *rn,
     i = 0;
     d = rotate ? ngx_random() % n : 0;
 
+    /*
+     * When prefer_ipv6 is set, put IPv6 addresses first in the result list.
+     * nginx tries addresses in order, so this makes it prefer IPv6 upstreams.
+     * Falls back to IPv4 automatically if IPv6 connect fails (nginx retries
+     * the next address in the list).
+     */
+#if (NGX_HAVE_INET6)
+    if (r->prefer_ipv6 && rn->naddrs6) {
+        /* IPv6 first, then IPv4 */
+        j = rotate ? ngx_random() % rn->naddrs6 : 0;
+
+        addr6 = (rn->naddrs6 == 1) ? &rn->u6.addr6 : rn->u6.addrs6;
+
+        do {
+            sin6 = &sockaddr[d].sockaddr_in6;
+            sin6->sin6_family = AF_INET6;
+            ngx_memcpy(sin6->sin6_addr.s6_addr, addr6[j++].s6_addr, 16);
+            dst[d].sockaddr = (struct sockaddr *) sin6;
+            dst[d++].socklen = sizeof(struct sockaddr_in6);
+
+            if (d == n) {
+                d = 0;
+            }
+
+            if (j == rn->naddrs6) {
+                j = 0;
+            }
+        } while (++i < (ngx_uint_t) rn->naddrs6);
+
+        if (rn->naddrs) {
+            j = rotate ? ngx_random() % rn->naddrs : 0;
+
+            addr = (rn->naddrs == 1) ? &rn->u.addr : rn->u.addrs;
+
+            do {
+                sin = &sockaddr[d].sockaddr_in;
+                sin->sin_family = AF_INET;
+                sin->sin_addr.s_addr = addr[j++];
+                dst[d].sockaddr = (struct sockaddr *) sin;
+                dst[d++].socklen = sizeof(struct sockaddr_in);
+
+                if (d == n) {
+                    d = 0;
+                }
+
+                if (j == (ngx_uint_t) rn->naddrs) {
+                    j = 0;
+                }
+            } while (++i < n);
+        }
+
+        return dst;
+    }
+#endif
+
+    /* Default: IPv4 first, then IPv6 (stock nginx behavior) */
     if (rn->naddrs) {
         j = rotate ? ngx_random() % rn->naddrs : 0;
 

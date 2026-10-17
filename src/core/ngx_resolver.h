@@ -202,6 +202,15 @@ struct ngx_resolver_s {
      * Requires CAP_NET_RAW.
      */
     ngx_str_t                *interface;
+
+    /*
+     * When set (via `prefer_ipv6=on` argument to the `resolver` directive),
+     * the resolver returns AAAA records BEFORE A records in the address list
+     * passed to upstream connect. nginx tries addresses in order, so this
+     * effectively makes nginx prefer IPv6 upstream connections when both are
+     * available. Falls back to IPv4 if IPv6 connect fails.
+     */
+    unsigned                  prefer_ipv6:1;
 };
 
 
