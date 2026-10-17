@@ -2090,6 +2090,28 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
             pipe = from_upstream ? u->pipe_u2c : u->pipe_c2u;
 
             /*
+             * CRITICAL: Check for pending data in the buffer chain.
+             *
+             * When ssl_preread on; is used, the TLS ClientHello is stored
+             * in the *out chain (u->upstream_out for client→upstream, or
+             * u->downstream_out for upstream→client). This data was read
+             * into userspace by the ssl_preread module and MUST be sent
+             * via the normal buffer path (recv/send), NOT splice.
+             *
+             * If we enter the splice path while *out or *busy has data,
+             * the preread bytes get lost — the TLS handshake fails, and
+             * connections through WireGuard tunnels break.
+             *
+             * Solution: if *out or *busy is non-NULL, fall through to the
+             * normal buffer path. Once the chains are empty (all preread
+             * data has been sent), splice takes over for all subsequent
+             * data.
+             */
+            if (*out != NULL || *busy != NULL) {
+                goto splice_fallback;  /* use normal buffer path */
+            }
+
+            /*
              * Step 1: Drain pending data from pipe → dst.
              *
              * This runs on EVERY event (read or write). If a previous
@@ -2246,6 +2268,8 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
         splice_done:
             break;
         }
+
+    splice_fallback:
 #endif
 
         if (do_write && dst) {
