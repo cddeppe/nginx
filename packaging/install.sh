@@ -393,16 +393,9 @@ main() {
 
     install_deps
 
-    # Determine if this is an upgrade (nginx-geosite already installed)
-    # vs a fresh install. This affects whether we auto-start nginx at the end.
-    local was_installed=0
-    if dpkg -l nginx-geosite 2>/dev/null | grep -q '^ii'; then
-        was_installed=1
-    fi
-
-    # Also snapshot whether nginx is currently running. If yes, we'll
-    # restart it to pick up the new binary. If no but it was installed
-    # (i.e. it was in a failed state), we'll start it after install.
+    # Snapshot whether nginx is currently running. If yes, we'll restart it
+    # to pick up the new binary. This is the only case that needs the snapshot
+    # — for "start after install", we just check the post-install state.
     local was_running=0
     if was_nginx_running; then
         was_running=1
@@ -420,57 +413,59 @@ main() {
     ensure_cron
     enable_service
 
-    # Decide what to do with the service after install:
+    # Post-install service management — simple rules:
     #
-    # Case 1: nginx was running before → restart it to load the new binary.
+    # Rule 1: If nginx was running before → restart it to load the new binary.
     #         (systemctl reload is NOT enough — only restart swaps the binary.)
     #
-    # Case 2: nginx-geosite was already installed but service was down/failed
-    #         (e.g. orphan worker bug, boot race condition, manual stop).
-    #         → Start it. The user ran install.sh to fix things, so they
-    #           expect the service to be working after.
+    # Rule 2: If nginx is NOT running after install AND config is valid → start it.
+    #         This covers all "nginx was down/failed before install" cases:
+    #         - Orphan worker bug (now fixed)
+    #         - Boot race condition
+    #         - Manual stop
+    #         - Failed previous install
+    #         The user ran install.sh — they expect nginx to be working after.
     #
-    # Case 3: Fresh install (was_installed=0) and --start not passed.
-    #         → Don't start. User may need to edit /etc/nginx/nginx.conf first.
-    #         → Print the "edit config then start" gate message.
+    # Rule 3: If nginx -t fails, don't start (would leave it down with bad config).
+    #         Print a clear error with the config issue.
     #
-    # Case 4: Fresh install + --start flag.
-    #         → Start it.
+    # Rule 4: --start flag is now mostly redundant (Rule 2 covers it), but kept
+    #         for backward compatibility.
     if [[ $was_running -eq 1 ]]; then
         restart_service_if_was_running
-    elif [[ $was_installed -eq 1 ]]; then
-        # Upgrade of an existing install where nginx was down/failed.
-        # The user is fixing something — bring the service back up.
-        log "nginx-geosite was already installed but service was down — starting it"
+    fi
+
+    # If nginx is still not running (either was_running=0, or restart failed),
+    # try to start it. This is the catch-all that ensures nginx ends up running.
+    if ! was_nginx_running; then
         if /usr/sbin/nginx -t -q -c /etc/nginx/nginx.conf 2>/dev/null; then
+            log "Starting nginx (was not running after install)"
             if systemctl start nginx.service; then
-                log "nginx started"
+                log "nginx started successfully"
                 systemctl status nginx.service --no-pager -l 2>/dev/null | head -5 || true
             else
-                warn "nginx start failed — check journalctl -u nginx"
+                warn "nginx start failed — check:"
+                warn "  sudo journalctl -u nginx --no-pager -n 30"
+                warn "  sudo nginx -t"
             fi
         else
             warn "nginx -t failed — NOT starting (config is broken)"
-            warn "fix /etc/nginx/nginx.conf then run: sudo systemctl start nginx"
+            warn "Run 'sudo nginx -t' to see the error, fix /etc/nginx/nginx.conf,"
+            warn "then run: sudo systemctl start nginx"
         fi
-    fi
-
-    # If user passed --start AND nginx is still not running, start it.
-    # Covers fresh install case (was_installed=0) where user wants it running now.
-    if [[ $do_start -eq 1 ]] && ! was_nginx_running; then
-        start_service
     fi
 
     print_next_steps
 
-    # Only print the "edit config then start" gate message for true fresh
-    # installs (was_installed=0). For upgrades where nginx ended up down
-    # (e.g. start failed despite our best effort), the user already saw
-    # the warning above with the actual error — no need to repeat.
-    if [[ $was_installed -eq 0 ]] && [[ $was_running -eq 0 ]] && [[ $do_start -eq 0 ]]; then
-        log "Service NOT started — edit /etc/nginx/nginx.conf first,"
-        log "then run: sudo systemctl start nginx"
-        log "(Re-run with --start to skip this gate.)"
+    # Print the "edit config then start" gate message ONLY for true fresh
+    # installs where nginx -t failed (config is the package default, user
+    # probably needs to customize it). For upgrades where nginx started
+    # successfully, no message needed.
+    if ! was_nginx_running; then
+        if ! /usr/sbin/nginx -t -q -c /etc/nginx/nginx.conf 2>/dev/null; then
+            log "Service NOT started — nginx -t failed."
+            log "Edit /etc/nginx/nginx.conf, then run: sudo systemctl start nginx"
+        fi
     fi
 }
 
