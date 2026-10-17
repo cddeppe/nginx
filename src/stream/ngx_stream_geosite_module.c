@@ -561,18 +561,20 @@ ngx_stream_geosite_parse_domain(ngx_conf_t *cf,
 
     case NGX_GEOSITE_TYPE_FULL:
         if (ngx_hash_add_key(full_keys, &lc_value, (void *) 1,
-                             NGX_HASH_READONLY_KEY) != NGX_OK)
+                             NGX_HASH_READONLY_KEY) == NGX_ERROR)
         {
-            /* ignore duplicates */
+            /* NGX_BUSY (duplicate key) is fine; NGX_ERROR is not */
+            return NGX_ERROR;
         }
         cat->full_count++;
         break;
 
     case NGX_GEOSITE_TYPE_DOMAIN:
         if (ngx_hash_add_key(domain_keys, &lc_value, (void *) 1,
-                             NGX_HASH_READONLY_KEY) != NGX_OK)
+                             NGX_HASH_READONLY_KEY) == NGX_ERROR)
         {
-            /* ignore duplicates */
+            /* NGX_BUSY (duplicate key) is fine; NGX_ERROR is not */
+            return NGX_ERROR;
         }
         cat->domain_count++;
         break;
