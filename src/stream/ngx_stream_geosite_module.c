@@ -529,6 +529,8 @@ ngx_stream_geosite_parse_domain(ngx_conf_t *cf,
         if (field_no == NGX_GEOSITE_DOMAIN_FIELD_VALUE && wire == NGX_PB_WIRE_LEN) {
             str_end = ngx_pb_read_len(&p, end, &len);
             if (str_end == NULL) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "geosite: truncated domain value length");
                 return NGX_ERROR;
             }
             value.data = p;
@@ -642,7 +644,11 @@ ngx_stream_geosite_process_geosite(ngx_conf_t *cf,
 
         if (field_no == NGX_GEOSITE_FIELD_COUNTRY_CODE && wire == NGX_PB_WIRE_LEN) {
             str_end = ngx_pb_read_len(&p, end, &len);
-            if (str_end == NULL) return NGX_ERROR;
+            if (str_end == NULL) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "geosite: truncated country_code length");
+                return NGX_ERROR;
+            }
             country_code.data = p;
             country_code.len = len;
             p = str_end;
@@ -651,6 +657,8 @@ ngx_stream_geosite_process_geosite(ngx_conf_t *cf,
              * (with filter check). */
             if (cat == NULL) {
                 if (country_code.len == 0) {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                       "geosite: empty country_code");
                     return NGX_ERROR;
                 }
 
@@ -716,7 +724,11 @@ ngx_stream_geosite_process_geosite(ngx_conf_t *cf,
 
         if (field_no == NGX_GEOSITE_FIELD_DOMAIN && wire == NGX_PB_WIRE_LEN) {
             str_end = ngx_pb_read_len(&p, end, &len);
-            if (str_end == NULL) return NGX_ERROR;
+            if (str_end == NULL) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "geosite: truncated domain entry length");
+                return NGX_ERROR;
+            }
             dom_body = p;
             dom_end = str_end;
             p = str_end;
@@ -737,6 +749,8 @@ ngx_stream_geosite_process_geosite(ngx_conf_t *cf,
         }
 
         if (ngx_pb_skip_field(&p, end, wire) != NGX_OK) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "geosite: malformed field in GeoSite entry");
             return NGX_ERROR;
         }
     }
