@@ -3,6 +3,10 @@ Description=nginx (cddeppe fork — geosite + proxy_interface)
 Documentation=https://github.com/cddeppe/nginx/blob/master/GEOSITE.md
 After=network-online.target network.target remote-fs.target
 Wants=network-online.target
+# Restart on failure — boot race condition protection.
+# These two directives MUST be in [Unit], not [Service] (systemd requirement).
+StartLimitIntervalSec=30
+StartLimitBurst=10
 
 [Service]
 Type=forking
@@ -10,43 +14,27 @@ PIDFile=/run/nginx.pid
 ExecStartPre=/usr/sbin/nginx -t -q -c /etc/nginx/nginx.conf
 ExecStart=/usr/sbin/nginx -c /etc/nginx/nginx.conf
 ExecReload=/usr/sbin/nginx -s reload
-ExecStop=/bin/kill -s QUIT $MAINPID
+ExecStop=/bin/kill -s TERM $MAINPID
 PrivateTmp=true
 
 # Grant capabilities needed for:
 # - binding to ports < 1024 (CAP_NET_BIND_SERVICE for ports 80, 443)
 # - SO_BINDTODEVICE in proxy_interface (CAP_NET_RAW)
-#
-# Do NOT set CapabilityBoundingSet here — that would strip CAP_DAC_OVERRIDE
-# (which root needs to open log files) and CAP_SETUID/CAP_SETGID (which
-# nginx needs to switch to the worker user). AmbientCapabilities alone
-# is enough to grant the two extra caps we need on top of root's defaults.
 AmbientCapabilities=CAP_NET_RAW CAP_NET_BIND_SERVICE
 
 # Give nginx time to parse dlc.dat (~2.3 MB) before systemd gives up.
-# First start after install can take 1-2 seconds while geosite hashes build.
 TimeoutStartSec=30
-# Graceful shutdown can take a while with long-lived connections (24h
-# proxy_timeout). Give nginx 60s to drain before SIGKILL.
+# Graceful shutdown can take a while with long-lived connections.
 TimeoutStopSec=60
-# KillMode=mixed: systemd sends SIGTERM to main process, then SIGKILL to
-# remaining processes (workers) after TimeoutStopSec. This avoids orphan
-# workers when the master takes a long time to drain.
-# KillSignal=TERM: nginx treats SIGTERM as graceful shutdown (drains
-# connections), SIGQUIT is also graceful but with more logging. TERM is
-# safer because it doesn't dump core on certain error states.
+# KillMode=mixed: systemd sends SIGTERM to main, then SIGKILL to workers
+# after TimeoutStopSec. Prevents orphan workers holding ports.
 KillMode=mixed
 KillSignal=TERM
 
 # Restart on failure — covers boot race condition where secondary IPs
-# (especially on Oracle/AWS cloud instances) aren't bound yet when nginx
-# starts. systemd retries every 2s for up to 30s, by which time cloud-init
-# has assigned all IPs. Without this, users have to manually restart nginx
-# after every reboot.
+# aren't bound yet when nginx starts.
 Restart=on-failure
 RestartSec=2s
-StartLimitBurst=10
-StartLimitIntervalSec=30
 
 [Install]
 WantedBy=multi-user.target
