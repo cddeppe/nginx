@@ -571,11 +571,28 @@ ngx_stream_geosite_parse_domain(ngx_conf_t *cf,
         break;
 
     case NGX_GEOSITE_TYPE_PLAIN:
+        /*
+         * ngx_strnstr() at match time requires a NUL-terminated needle:
+         * it calls ngx_strlen() on the find string. lc_value is an
+         * exact-length pool slice with no terminator, so storing it
+         * directly lets that strlen() read past the end of the slice
+         * (and can match a longer string than intended). Store a
+         * terminated copy instead.
+         */
         plain = ngx_array_push(&cat->plain_array);
         if (plain == NULL) {
             return NGX_ERROR;
         }
-        *plain = lc_value;
+
+        plain->data = ngx_pnalloc(cf->cycle->pool, lc_value.len + 1);
+        if (plain->data == NULL) {
+            return NGX_ERROR;
+        }
+
+        ngx_memcpy(plain->data, lc_value.data, lc_value.len);
+        plain->data[lc_value.len] = '\0';
+        plain->len = lc_value.len;
+
         cat->plain_count++;
         break;
 
