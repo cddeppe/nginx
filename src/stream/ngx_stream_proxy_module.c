@@ -2080,9 +2080,9 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
                             b->pos = p;
                             b->last = p;
 
-                            ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
-                                           "stream proxy buffer grown "
-                                           "to %uz bytes", size);
+                            ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                                          "stream proxy buffer grown to %uz "
+                                          "bytes", size);
                         }
 
                         *fill = 0;
