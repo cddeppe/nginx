@@ -152,6 +152,16 @@ typedef struct {
     unsigned                           connected:1;
     unsigned                           proxy_protocol:2;
     unsigned                           half_closed:1;
+
+#if (NGX_LINUX)
+    /* Splice pipes for zero-copy proxying:
+     *   pipe_c2u[2] — client to upstream
+     *   pipe_u2c[2] — upstream to client
+     * -1 = not allocated. */
+    int                               pipe_c2u[2];
+    int                               pipe_u2c[2];
+    unsigned                          splice_active:1;
+#endif
 } ngx_stream_upstream_t;
 
 

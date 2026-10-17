@@ -9,6 +9,11 @@
 #include <ngx_core.h>
 #include <ngx_stream.h>
 
+#if (NGX_LINUX)
+#include <fcntl.h>          /* fcntl, F_SETPIPE_SZ */
+#include <sys/stat.h>       /* fstat */
+#endif
+
 
 typedef struct {
     ngx_addr_t                      *addr;
@@ -32,6 +37,7 @@ typedef struct {
     ngx_flag_t                       next_upstream;
     ngx_uint_t                       proxy_protocol;
     ngx_flag_t                       half_close;
+    ngx_flag_t                       splice;
     ngx_stream_upstream_local_t     *local;
     /*
      * Interface name (or complex value evaluating to one) for
@@ -312,6 +318,13 @@ static ngx_command_t  ngx_stream_proxy_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_STREAM_SRV_CONF_OFFSET,
       offsetof(ngx_stream_proxy_srv_conf_t, half_close),
+      NULL },
+
+    { ngx_string("proxy_splice"),
+      NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_proxy_srv_conf_t, splice),
       NULL },
 
 #if (NGX_STREAM_SSL)
@@ -1043,6 +1056,46 @@ ngx_stream_proxy_init_upstream(ngx_stream_session_t *s)
     u->download_rate = ngx_stream_complex_value_size(s, pscf->download_rate, 0);
 
     u->connected = 1;
+
+#if (NGX_LINUX)
+    /* Allocate splice pipes if proxy_splice on; and no incompatible features */
+    if (pscf->splice
+        && c->type == SOCK_STREAM
+        && pc->type == SOCK_STREAM
+        && !pscf->upload_rate && !pscf->download_rate
+        && !u->proxy_protocol)
+    {
+        u->pipe_c2u[0] = -1; u->pipe_c2u[1] = -1;
+        u->pipe_u2c[0] = -1; u->pipe_u2c[1] = -1;
+
+        if (pipe2(u->pipe_c2u, O_NONBLOCK) == 0
+            && pipe2(u->pipe_u2c, O_NONBLOCK) == 0)
+        {
+            /* Increase pipe buffer to 1MB for throughput */
+            int pipe_sz = 1 << 20; /* 1 MB */
+            fcntl(u->pipe_c2u[0], F_SETPIPE_SZ, pipe_sz);
+            fcntl(u->pipe_u2c[0], F_SETPIPE_SZ, pipe_sz);
+
+            u->splice_active = 1;
+
+            ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                          "proxy_splice: enabled (pipes allocated, "
+                          "buffer=%d bytes)",
+                          fcntl(u->pipe_c2u[0], F_GETPIPE_SZ));
+        } else {
+            ngx_log_error(NGX_LOG_WARN, c->log, ngx_socket_errno,
+                          "proxy_splice: pipe2() failed, falling back "
+                          "to buffer mode");
+            if (u->pipe_c2u[0] != -1) { close(u->pipe_c2u[0]); close(u->pipe_c2u[1]); }
+            if (u->pipe_u2c[0] != -1) { close(u->pipe_u2c[0]); close(u->pipe_u2c[1]); }
+            u->pipe_c2u[0] = u->pipe_c2u[1] = -1;
+            u->pipe_u2c[0] = u->pipe_u2c[1] = -1;
+        }
+    } else {
+        u->pipe_c2u[0] = u->pipe_c2u[1] = -1;
+        u->pipe_u2c[0] = u->pipe_u2c[1] = -1;
+    }
+#endif
 
     pc->read->handler = ngx_stream_proxy_upstream_handler;
     pc->write->handler = ngx_stream_proxy_upstream_handler;
@@ -2017,6 +2070,94 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
 
     for ( ;; ) {
 
+#if (NGX_LINUX)
+        /* === Splice (zero-copy) path ===
+         * When proxy_splice on; is active, bypass the userspace buffer
+         * entirely. Data flows: src socket → kernel pipe → dst socket.
+         * No memcpy, no buffer management, no filter chain.
+         */
+        if (u->splice_active && dst && src->read->ready && !src->read->delayed) {
+
+            int  *pipe;  /* pipe for this direction */
+
+            pipe = from_upstream ? u->pipe_u2c : u->pipe_c2u;
+
+            c->log->action = recv_action;
+
+            /* Step 1: splice from source socket into pipe write end */
+            n = splice(src->fd, NULL, pipe[1], NULL, 65536,
+                       SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+
+            if (n == -1) {
+                if (ngx_socket_errno == NGX_EAGAIN) {
+                    break;  /* source has no data right now */
+                }
+                if (ngx_socket_errno == NGX_EINTR) {
+                    continue;
+                }
+                /* Real error — treat as EOF */
+                src->read->eof = 1;
+                n = 0;
+            }
+
+            if (n == 0) {
+                src->read->eof = 1;
+            }
+
+            if (n > 0) {
+                *received += n;
+                (*packets)++;
+
+                if (from_upstream) {
+                    if (u->state->first_byte_time == (ngx_msec_t) -1) {
+                        u->state->first_byte_time = ngx_current_msec
+                                                    - u->start_time;
+                    }
+                }
+
+                /* Step 2: splice from pipe read end to destination socket */
+                ssize_t  written = 0;
+                while (written < n) {
+                    ssize_t  sn;
+                    sn = splice(pipe[0], NULL, dst->fd, NULL, n - written,
+                               SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+
+                    if (sn == -1) {
+                        if (ngx_socket_errno == NGX_EAGAIN) {
+                            /* Destination not writable — data stays in pipe.
+                             * It will be drained on the next writable event.
+                             * The pipe buffer (1MB) can hold plenty of data. */
+                            break;
+                        }
+                        if (ngx_socket_errno == NGX_EINTR) {
+                            continue;
+                        }
+                        ngx_connection_error(c, ngx_socket_errno,
+                                             "splice() to destination failed");
+                        ngx_stream_proxy_finalize(s,
+                                                  NGX_STREAM_INTERNAL_SERVER_ERROR);
+                        return;
+                    }
+                    written += sn;
+                }
+
+                do_write = 1;
+                continue;
+            }
+
+            /* EOF on source */
+            if (src->read->eof) {
+                if (ngx_stream_proxy_test_finalize(s, from_upstream)
+                    == NGX_OK)
+                {
+                    return;
+                }
+            }
+
+            break;
+        }
+#endif
+
         if (do_write && dst) {
 
             if (*out || *busy || dst->buffered) {
@@ -2342,6 +2483,20 @@ ngx_stream_proxy_finalize(ngx_stream_session_t *s, ngx_uint_t rc)
         goto noupstream;
     }
 
+#if (NGX_LINUX)
+    /* Close splice pipes if they were allocated */
+    if (u->pipe_c2u[0] != -1) {
+        close(u->pipe_c2u[0]);
+        close(u->pipe_c2u[1]);
+        u->pipe_c2u[0] = u->pipe_c2u[1] = -1;
+    }
+    if (u->pipe_u2c[0] != -1) {
+        close(u->pipe_u2c[0]);
+        close(u->pipe_u2c[1]);
+        u->pipe_u2c[0] = u->pipe_u2c[1] = -1;
+    }
+#endif
+
     if (u->resolved && u->resolved->ctx) {
         ngx_resolve_name_done(u->resolved->ctx);
         u->resolved->ctx = NULL;
@@ -2465,6 +2620,7 @@ ngx_stream_proxy_create_srv_conf(ngx_conf_t *cf)
     conf->socket_rcvbuf = NGX_CONF_UNSET_SIZE;
     conf->socket_sndbuf = NGX_CONF_UNSET_SIZE;
     conf->half_close = NGX_CONF_UNSET;
+    conf->splice = NGX_CONF_UNSET;
 
 #if (NGX_STREAM_SSL)
     conf->ssl_enable = NGX_CONF_UNSET;
@@ -2531,6 +2687,7 @@ ngx_stream_proxy_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_size_value(conf->socket_sndbuf, prev->socket_sndbuf, 0);
 
     ngx_conf_merge_value(conf->half_close, prev->half_close, 0);
+    ngx_conf_merge_value(conf->splice, prev->splice, 0);
 
 #if (NGX_STREAM_SSL)
 
