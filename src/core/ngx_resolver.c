@@ -4630,11 +4630,23 @@ ngx_udp_connect(ngx_resolver_connection_t *rec)
             goto failed;
         }
 
-        ngx_log_debug1(NGX_LOG_DEBUG_CORE, &rec->log, 0,
-                       "resolver SO_BINDTODEVICE: %V",
-                       rec->resolver->interface);
+        ngx_log_error(NGX_LOG_INFO, &rec->log, 0,
+                      "resolver: SO_BINDTODEVICE(\"%V\") applied on UDP socket "
+                      "to DNS server %V",
+                      rec->resolver->interface, &rec->server);
     }
 #endif
+
+    /* Log whether interface binding was applied or not — helps diagnose
+     * DNS leaks where the resolver is NOT going through the tunnel. */
+    if (rec->resolver == NULL || rec->resolver->interface == NULL
+        || rec->resolver->interface->len == 0)
+    {
+        ngx_log_error(NGX_LOG_INFO, &rec->log, 0,
+                      "resolver: NO interface binding — DNS query to %V goes "
+                      "via default route (NOT through any tunnel)",
+                      &rec->server);
+    }
 
     rev = c->read;
     wev = c->write;
