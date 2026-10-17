@@ -115,14 +115,12 @@ typedef struct {
 
 /*
  * Main configuration: the loaded file path, the (optional) tag filter,
- * the parsed categories, and a hash mapping tag → category index for
- * fast lookup during variable evaluation.
+ * and the parsed categories.
  */
 typedef struct {
     ngx_str_t                            *file_path;
     ngx_array_t                          *filters;     /* ngx_str_t */
     ngx_array_t                          *categories;  /* ngx_stream_geosite_category_t */
-    ngx_hash_t                            tag_index;   /* tag (lowercased) → category ptr */
     ngx_uint_t                            hash_bucket_size;
     ngx_uint_t                            hash_max_size;
     ngx_flag_t                            loaded;
@@ -807,9 +805,7 @@ ngx_stream_geosite_build_hashes(ngx_conf_t *cf,
     ngx_stream_geosite_category_t   *cats;
     ngx_uint_t                       i, n;
     ngx_hash_keys_arrays_t          *full_keys, *domain_keys;
-    ngx_hash_keys_arrays_t           tag_keys;
     ngx_hash_init_t                  hash_init;
-    ngx_stream_geosite_category_t  **cat_slot;
     ngx_uint_t                       bucket_size, max_size;
 
     if (gmcf->categories == NULL || gmcf->categories->nelts == 0) {
@@ -886,46 +882,6 @@ ngx_stream_geosite_build_hashes(ngx_conf_t *cf,
         } else {
             cats[i].domain_hash.buckets = NULL;
             cats[i].domain_hash.size = 0;
-        }
-    }
-
-    /*
-     * Build tag → category-pointer hash for O(1) lookup during variable
-     * evaluation.
-     */
-    ngx_memzero(&tag_keys, sizeof(ngx_hash_keys_arrays_t));
-    tag_keys.pool = cf->pool;
-    tag_keys.temp_pool = cf->pool;
-    if (ngx_hash_keys_array_init(&tag_keys, NGX_HASH_SMALL) != NGX_OK) {
-        return NGX_ERROR;
-    }
-
-    for (i = 0; i < n; i++) {
-        cat_slot = ngx_palloc(cf->cycle->pool,
-                              sizeof(ngx_stream_geosite_category_t *));
-        if (cat_slot == NULL) return NGX_ERROR;
-        *cat_slot = &cats[i];
-
-        if (ngx_hash_add_key(&tag_keys, &cats[i].tag, cat_slot,
-                             NGX_HASH_READONLY_KEY) != NGX_OK)
-        {
-            /* duplicate tag — keep first */
-        }
-    }
-
-    hash_init.hash = &gmcf->tag_index;
-    hash_init.key = ngx_hash_key_lc;
-    hash_init.max_size = 512;
-    hash_init.bucket_size = ngx_align(64, ngx_cacheline_size);
-    hash_init.name = "geosite_tag_index";
-    hash_init.pool = cf->cycle->pool;
-    hash_init.temp_pool = cf->pool;
-
-    if (tag_keys.keys.nelts > 0) {
-        if (ngx_hash_init(&hash_init, tag_keys.keys.elts,
-                          tag_keys.keys.nelts) != NGX_OK)
-        {
-            return NGX_ERROR;
         }
     }
 
