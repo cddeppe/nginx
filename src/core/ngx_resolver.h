@@ -193,15 +193,12 @@ struct ngx_resolver_s {
     ngx_uint_t                log_level;
 
     /*
-     * Optional network interface name (e.g. "wg0", "alb") for SO_BINDTODEVICE
-     * on resolver UDP/TCP sockets. Set via `interface=name` argument to the
-     * `resolver` directive. When set, all DNS queries egress via the named
-     * interface, bypassing the kernel routing table — same semantics as
-     * proxy_interface, but for DNS instead of proxy_pass upstreams.
-     *
-     * Requires CAP_NET_RAW.
+     * Interface name for SO_BINDTODEVICE on resolver sockets.
+     * Stored as inline char array (not pointer) to avoid any pointer
+     * indirection issues across architectures.
      */
-    ngx_str_t                *interface;
+    char                      interface[16]; /* IFNAMSIZ */
+    ngx_uint_t                interface_len;
 
     /*
      * When set (via `prefer_ipv6=on` argument to the `resolver` directive),
