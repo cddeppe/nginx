@@ -139,6 +139,8 @@ typedef struct {
     time_t                             start_sec;
     ngx_uint_t                         requests;
     ngx_uint_t                         responses;
+    ngx_uint_t                         upstream_fill;    /* full-read streak, up direction */
+    ngx_uint_t                         downstream_fill;  /* full-read streak, down direction */
     ngx_msec_t                         start_time;
 
     size_t                             upload_rate;

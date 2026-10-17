@@ -24,6 +24,13 @@ typedef struct {
     ngx_msec_t                       timeout;
     ngx_msec_t                       next_upstream_timeout;
     size_t                           buffer_size;
+    /*
+     * Upper bound for adaptive per-direction buffer growth (0 = off,
+     * the default). When set above proxy_buffer_size, a direction whose
+     * reads keep filling its buffer completely has the buffer grown in
+     * x4 steps up to this size, after the pending data fully drains.
+     */
+    size_t                           buffer_max_size;
     ngx_stream_complex_value_t      *upload_rate;
     ngx_stream_complex_value_t      *download_rate;
     ngx_uint_t                       requests;
@@ -236,6 +243,13 @@ static ngx_command_t  ngx_stream_proxy_commands[] = {
       NGX_STREAM_SRV_CONF_OFFSET,
       offsetof(ngx_stream_proxy_srv_conf_t, buffer_size),
       &ngx_conf_size_nonzero_post },
+
+    { ngx_string("proxy_buffer_max_size"),
+      NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_size_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_proxy_srv_conf_t, buffer_max_size),
+      NULL },
 
     { ngx_string("proxy_downstream_buffer"),
       NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
@@ -1955,12 +1969,13 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
     ngx_uint_t do_write)
 {
     char                         *recv_action, *send_action;
+    u_char                       *p;
     off_t                        *received, limit;
     size_t                        size, limit_rate;
     ssize_t                       n;
     ngx_buf_t                    *b;
     ngx_int_t                     rc;
-    ngx_uint_t                    flags, *packets;
+    ngx_uint_t                    flags, *packets, *fill;
     ngx_msec_t                    delay;
     ngx_chain_t                  *cl, **ll, **out, **busy;
     ngx_connection_t             *c, *pc, *src, *dst;
@@ -1997,6 +2012,7 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
         limit_rate = u->download_rate;
         received = &u->received;
         packets = &u->responses;
+        fill = &u->upstream_fill;
         out = &u->downstream_out;
         busy = &u->downstream_busy;
         recv_action = "proxying and reading from upstream";
@@ -2009,6 +2025,7 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
         limit_rate = u->upload_rate;
         received = &s->received;
         packets = &u->requests;
+        fill = &u->downstream_fill;
         out = &u->upstream_out;
         busy = &u->upstream_busy;
         recv_action = "proxying and reading from client";
@@ -2035,6 +2052,41 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
                 if (*busy == NULL) {
                     b->pos = b->start;
                     b->last = b->start;
+
+                    /*
+                     * Adaptive growth: this direction's buffer has
+                     * fully drained, and the reader filled it to the
+                     * brim three times in a row. Grow in x4 steps,
+                     * capped by proxy_buffer_max_size. The swap is safe
+                     * here: *out was consumed and *busy is empty, so no
+                     * chain still references b. The replaced block
+                     * stays in the connection pool until the session
+                     * ends (worst case ~1.3x the final size held).
+                     */
+                    if (pscf->buffer_max_size > (size_t) (b->end - b->start)
+                        && *fill >= 3)
+                    {
+                        size = (size_t) (b->end - b->start) * 4;
+
+                        if (size > pscf->buffer_max_size) {
+                            size = pscf->buffer_max_size;
+                        }
+
+                        p = ngx_pnalloc(c->pool, size);
+
+                        if (p != NULL) {
+                            b->start = p;
+                            b->end = p + size;
+                            b->pos = p;
+                            b->last = p;
+
+                            ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
+                                           "stream proxy buffer grown "
+                                           "to %uz bytes", size);
+                        }
+
+                        *fill = 0;
+                    }
                 }
             }
         }
@@ -2116,6 +2168,23 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
                 (*packets)++;
                 *received += n;
                 b->last += n;
+
+                /*
+                 * Track whether this read filled the buffer completely:
+                 * a sustained streak of full fills means the reader is
+                 * delivering more per event than the buffer can hold -
+                 * the connection is throughput-bound. Only maintained
+                 * for TCP sessions (a UDP "buffer" must hold one max
+                 * datagram; growing it on datagram fills is wrong).
+                 */
+                if (pscf->buffer_max_size && c->type == SOCK_STREAM) {
+                    if (b->last == b->end) {
+                        (*fill)++;
+                    } else {
+                        *fill = 0;
+                    }
+                }
+
                 do_write = 1;
 
                 continue;
@@ -2452,6 +2521,7 @@ ngx_stream_proxy_create_srv_conf(ngx_conf_t *cf)
     conf->timeout = NGX_CONF_UNSET_MSEC;
     conf->next_upstream_timeout = NGX_CONF_UNSET_MSEC;
     conf->buffer_size = NGX_CONF_UNSET_SIZE;
+    conf->buffer_max_size = NGX_CONF_UNSET_SIZE;
     conf->upload_rate = NGX_CONF_UNSET_PTR;
     conf->download_rate = NGX_CONF_UNSET_PTR;
     conf->requests = NGX_CONF_UNSET_UINT;
@@ -2502,6 +2572,18 @@ ngx_stream_proxy_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_size_value(conf->buffer_size,
                               prev->buffer_size, 16384);
+
+    ngx_conf_merge_size_value(conf->buffer_max_size,
+                              prev->buffer_max_size, 0);
+
+    if (conf->buffer_max_size
+        && conf->buffer_max_size < conf->buffer_size)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "proxy_buffer_max_size must not be less "
+                           "than proxy_buffer_size");
+        return NGX_CONF_ERROR;
+    }
 
     ngx_conf_merge_ptr_value(conf->upload_rate, prev->upload_rate, NULL);
 
