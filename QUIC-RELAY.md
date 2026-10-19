@@ -154,6 +154,9 @@ quic_relay: stats: sessions=3/256 initial=41 retry=2 vn=0
 | `missRebound` | **Cronet-signature misses absorbed** (new port, unknown DCID) — on a phone field test this is the number that proves the wall is crossed |
 | `missDropped` | misses dropped (`strict_miss on`, no session yet, or quarantined source) |
 | `missPoisoned` | misses dropped because the source address is **quarantined** — a stale/foreign connection whose earlier miss steal was rolled back by the real owner (see below) |
+| `downDrop` | downstream `sendto()` failures on the client-facing socket |
+| `loopGuard` | upstream connects **refused** because the resolver answered the SNI with THIS relay's own address (resolver hijack — see below) |
+| `selfEcho` | client-side datagrams dropped because their source IP is this host itself (the echo of a resolver self-loop) |
 | `sniOk` / `sniFail` / `parseErr` | SNI extraction outcomes |
 
 ## Miss-steal quarantine (the post-restart blackhole defense)
@@ -185,6 +188,43 @@ The defense has three parts:
 Field signature: `quic_relay: miss steal rolled back by known-DCID packet;
 quarantining 1.2.3.4:5678 for 60s (stale or foreign connection)` followed by
 `missPoisoned>0` in the stats line. Videos must play through the storm.
+
+## Resolver self-loop guard (v22)
+
+The DNS hijack that routes the phone to this relay (dnsmasq answering
+"VPS IP" for the relayed domains) must NOT also serve the relay's own
+`resolver` directive. If it does, every session's upstream socket gets
+connected back to the relay itself, and the relay forwards client
+Initials to its own listen socket: the Initial re-enters as if from a
+new client, rebinds/steals sessions or -- with Cronet's zero-length-DCID
+Initials -- spawns an endless session chain, and the echoed client
+Initials arrive on the upstream socket masquerading as "server flights"
+(v21 diagnostics show them as `first downstream packet: 40 bytes ...`
+with `dcid_len=0 scid_len=8`, i.e. client-shaped). The handshake can
+never complete -- the client blackholes -- and the echo bounce keeps
+the looped sessions alive forever, burning CPU.
+
+Two in-module defenses (v22):
+
+1. **Connect guard.** The relay refuses to connect upstream to any
+   address of this host (all interface addresses + loopback), logged as
+   `quic_relay: LOOP GUARD: refusing upstream connect to THIS relay's
+   own address ... (sni=...)` (throttled to one line / 30 s) and
+   counted in `loopGuard`.
+2. **Entry guard.** Client-side datagrams whose source IP is this
+   host's own non-loopback address (our echo) are dropped, counted in
+   `selfEcho`. Loopback sources stay allowed for local test rigs.
+
+The fix on the operator side is one line in the relay config: point
+`resolver` at DNS servers that are NOT hijacking the relayed domains:
+
+```nginx
+resolver 8.8.8.8 1.1.1.1 valid=30s;   /* NOT the hijacked local dnsmasq */
+```
+
+Sanity check on the VPS: `dig @127.0.0.1 www.google.com` must NOT
+return the VPS's own IP. If it does, the relay must not use that
+resolver.
 
 ## Field test (phone)
 

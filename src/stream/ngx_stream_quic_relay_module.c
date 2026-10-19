@@ -39,6 +39,8 @@
 #include <ngx_core.h>
 #include <ngx_stream.h>
 
+#include <ifaddrs.h>              /* loop guard: local interface census */
+
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
 #include <openssl/hmac.h>
@@ -127,6 +129,156 @@ typedef struct ngx_qr_ctx_s  ngx_qr_ctx_t;
 
 
 static ngx_uint_t  ngx_qr_session_serial;
+
+
+/* ---------------------------------------------------------------------- */
+/* Loop guard: this host's own addresses.
+ *
+ * When the resolver that serves quic_relay is itself hijacked for the
+ * relayed domains (dnsmasq answering "VPS IP" -- the same hijack that
+ * routes the phone to this relay), every session's upstream socket is
+ * connected back to the relay's own listen socket.  Forwards then echo
+ * forever: the client Initial re-enters the listen path from the
+ * upstream socket's address, rebinds/steals sessions (ping-pong), or --
+ * with Cronet's zero-length-DCID Initials -- spawns an endless session
+ * chain; the echoed client Initials even masquerade as "server flights"
+ * in the diagnostics.  The handshake can never complete: the client
+ * blackholes and the echo bounce keeps the session alive forever.
+ *
+ * Two defenses: (a) refuse to CONNECT upstream to any address of this
+ * host (loopback included); (b) drop client-side datagrams whose source
+ * ip is one of this host's NON-loopback addresses (our own echo),
+ * while still allowing loopback sources for local test rigs. */
+
+#define NGX_QR_MAX_SELF_ADDRS   32
+
+static struct sockaddr_storage  ngx_qr_self_addrs[NGX_QR_MAX_SELF_ADDRS];
+static ngx_uint_t               ngx_qr_n_self_addrs;
+
+
+static ngx_int_t
+ngx_qr_is_loopback(struct sockaddr *addr)
+{
+    struct sockaddr_in   *sin;
+#if (NGX_HAVE_INET6)
+    struct sockaddr_in6  *sin6;
+#endif
+
+    if (addr->sa_family == AF_INET) {
+        sin = (struct sockaddr_in *) addr;
+        return (ntohl(sin->sin_addr.s_addr) & 0xff000000U) == 0x7f000000U;
+    }
+
+#if (NGX_HAVE_INET6)
+    if (addr->sa_family == AF_INET6) {
+        sin6 = (struct sockaddr_in6 *) addr;
+
+        /* ::1 */
+        if (sin6->sin6_addr.s6_addr[15] == 1
+            && ngx_memcmp(sin6->sin6_addr.s6_addr,
+                         "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 15) == 0)
+        {
+            return 1;
+        }
+
+        /* ::ffff:127.x.x.x */
+        if (ngx_memcmp(sin6->sin6_addr.s6_addr,
+                       "\0\0\0\0\0\0\0\0\0\0\xff\xff", 12) == 0)
+        {
+            return (ntohl(*(in_addr_t *) (sin6->sin6_addr.s6_addr + 12))
+                    & 0xff000000U) == 0x7f000000U;
+        }
+    }
+#endif
+
+    return 0;
+}
+
+
+/* exact-ip match against the registry (loopback handled separately) */
+static ngx_int_t
+ngx_qr_self_match(struct sockaddr *addr)
+{
+    ngx_uint_t           i;
+    struct sockaddr     *sa;
+    struct sockaddr_in  *sin, *sin4;
+    struct sockaddr_in   normalized;       /* v4 view of a v4-mapped v6 */
+#if (NGX_HAVE_INET6)
+    struct sockaddr_in6 *sin6;
+#endif
+
+    if (addr->sa_family == AF_INET) {
+        sin = (struct sockaddr_in *) addr;
+
+        for (i = 0; i < ngx_qr_n_self_addrs; i++) {
+            sa = (struct sockaddr *) &ngx_qr_self_addrs[i];
+            if (sa->sa_family != AF_INET) {
+                continue;
+            }
+            sin4 = (struct sockaddr_in *) sa;
+            if (sin->sin_addr.s_addr == sin4->sin_addr.s_addr) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+#if (NGX_HAVE_INET6)
+    if (addr->sa_family == AF_INET6) {
+        sin6 = (struct sockaddr_in6 *) addr;
+
+        /* v4-mapped: compare as plain v4 */
+        if (ngx_memcmp(sin6->sin6_addr.s6_addr,
+                       "\0\0\0\0\0\0\0\0\0\0\xff\xff", 12) == 0)
+        {
+            ngx_memzero(&normalized, sizeof(struct sockaddr_in));
+            normalized.sin_family = AF_INET;
+            normalized.sin_addr.s_addr =
+                *(in_addr_t *) (sin6->sin6_addr.s6_addr + 12);
+            return ngx_qr_self_match((struct sockaddr *) &normalized);
+        }
+
+        for (i = 0; i < ngx_qr_n_self_addrs; i++) {
+            sa = (struct sockaddr *) &ngx_qr_self_addrs[i];
+            if (sa->sa_family != AF_INET6) {
+                continue;
+            }
+            if (ngx_memcmp(&((struct sockaddr_in6 *) sa)->sin6_addr,
+                           &sin6->sin6_addr, 16) == 0)
+            {
+                return 1;
+            }
+        }
+    }
+#endif
+
+    return 0;
+}
+
+
+/* connect-time guard: any address of this host (loopback included) */
+static ngx_int_t
+ngx_qr_is_self_addr(struct sockaddr *addr)
+{
+    if (ngx_qr_is_loopback(addr)) {
+        return 1;
+    }
+
+    return ngx_qr_self_match(addr);
+}
+
+
+/* entry-time guard: our own echo (non-loopback local source only,
+ * loopback sources are legitimate local test clients) */
+static ngx_int_t
+ngx_qr_is_local_source(struct sockaddr *addr)
+{
+    if (ngx_qr_is_loopback(addr)) {
+        return 0;
+    }
+
+    return ngx_qr_self_match(addr);
+}
 
 
 struct ngx_qr_session_s {
@@ -266,6 +418,12 @@ typedef struct ngx_qr_ctx_s {
     uint64_t                    rebinding;
     uint64_t                    down_drops;      /* downstream sendto() failures
                                                    (client delivery) */
+    uint64_t                    loop_guard;      /* upstream connects refused:
+                                                   resolver answered with this
+                                                   relay's own address */
+    uint64_t                    self_echo;       /* client-side datagrams dropped:
+                                                   source is this host (echo) */
+    ngx_msec_t                  loop_warn;       /* last loop-guard log (throttle) */
     uint64_t                    parse_err;
     uint64_t                    decrypt_fail;
     uint64_t                    frame_err;
@@ -852,9 +1010,65 @@ ngx_qr_init_module(ngx_cycle_t *cycle)
 
         ls[i].handler = ngx_qr_new_peer;
 
+        /* loop-guard registry: this listen's address is a self address */
+        {
+            ngx_int_t  wildcard =
+                (ls[i].sockaddr->sa_family == AF_INET
+                 && ((struct sockaddr_in *) ls[i].sockaddr)->sin_addr.s_addr
+                    == INADDR_ANY);
+#if (NGX_HAVE_INET6)
+            if (!wildcard && ls[i].sockaddr->sa_family == AF_INET6) {
+                wildcard = ngx_memcmp(
+                    &((struct sockaddr_in6 *) ls[i].sockaddr)->sin6_addr,
+                    "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16) == 0;
+            }
+#endif
+            if (!wildcard && ngx_qr_n_self_addrs < NGX_QR_MAX_SELF_ADDRS) {
+                ngx_memcpy(&ngx_qr_self_addrs[ngx_qr_n_self_addrs],
+                           ls[i].sockaddr, ls[i].socklen);
+                ngx_qr_n_self_addrs++;
+            }
+        }
+
         ngx_log_error(NGX_LOG_INFO, cycle->log, 0,
                       "quic_relay: took over udp listen %V",
                       &ls[i].addr_text);
+    }
+
+    /* loop-guard registry: every local interface address (covers
+     * wildcard listens and interface aliases; loopback is matched by
+     * prefix in ngx_qr_is_loopback()) */
+    {
+        struct ifaddrs  *ifp = NULL, *ifa;
+
+        if (getifaddrs(&ifp) == 0) {
+            for (ifa = ifp; ifa != NULL; ifa = ifa->ifa_next) {
+                if (ifa->ifa_addr == NULL) {
+                    continue;
+                }
+
+                if (ifa->ifa_addr->sa_family != AF_INET
+#if (NGX_HAVE_INET6)
+                    && ifa->ifa_addr->sa_family != AF_INET6
+#endif
+                ) {
+                    continue;
+                }
+
+                if (ngx_qr_n_self_addrs >= NGX_QR_MAX_SELF_ADDRS) {
+                    break;
+                }
+
+                ngx_memcpy(&ngx_qr_self_addrs[ngx_qr_n_self_addrs],
+                           ifa->ifa_addr,
+                           ifa->ifa_addr->sa_family == AF_INET
+                           ? sizeof(struct sockaddr_in)
+                           : sizeof(struct sockaddr_in6));
+                ngx_qr_n_self_addrs++;
+            }
+
+            freeifaddrs(ifp);
+        }
     }
 
     /* sanity: session state is per-worker */
@@ -987,6 +1201,35 @@ ngx_qr_process_client_packet(ngx_connection_t *c, u_char *data, size_t len)
     ctx = (s != NULL) ? s->ctx : ngx_qr_ctx_from_conn(c);
 
     if (ctx == NULL) {
+        return;
+    }
+
+    /* Loop-guard entry defense: a datagram whose source ip is one of
+     * this host's own non-loopback addresses is our upstream socket
+     * echoing back through a resolver self-loop.  Admitting it lets the
+     * echo rebind/steal sessions and sustains an infinite bounce; real
+     * clients are always remote.  (Loopback sources stay allowed: local
+     * test rigs connect from 127.0.0.1.) */
+
+    if (ngx_qr_is_local_source(c->sockaddr)) {
+        ctx->self_echo++;
+
+        if (ngx_current_msec - ctx->loop_warn >= 30000) {
+            u_char     ipbuf[NGX_SOCKADDR_STRLEN];
+            ngx_str_t  ip;
+
+            ip.data = ipbuf;
+            ip.len = ngx_sock_ntop(c->sockaddr, c->socklen, ipbuf,
+                                   NGX_SOCKADDR_STRLEN, 1);
+            ctx->loop_warn = ngx_current_msec;
+            ngx_log_error(NGX_LOG_WARN, ctx->log, 0,
+                          "quic_relay: LOOP GUARD: dropped client-side"
+                          " datagram from this host's own address %V --"
+                          " the relay is echoing its own forwards; check"
+                          " that the \"resolver\" is not hijacking the"
+                          " relayed domains to this VPS IP", &ip);
+        }
+
         return;
     }
 
@@ -1633,6 +1876,33 @@ ngx_qr_connect_upstream(ngx_qr_session_t *s)
 
         addr = (struct sockaddr *) &s->up_list[s->up_idx];
 
+        if (ngx_qr_is_self_addr(addr)) {
+            u_char     ipbuf[NGX_SOCKADDR_STRLEN];
+            ngx_str_t  ip;
+
+            ip.data = ipbuf;
+            ip.len = ngx_sock_ntop(addr, s->up_socklens[s->up_idx], ipbuf,
+                                   NGX_SOCKADDR_STRLEN, 1);
+            ctx->loop_guard++;
+
+            if (ngx_current_msec - ctx->loop_warn >= 30000) {
+                ctx->loop_warn = ngx_current_msec;
+                ngx_log_error(NGX_LOG_ERR, ctx->log, 0,
+                              "quic_relay: LOOP GUARD: refusing upstream"
+                              " connect to THIS relay's own address %V"
+                              " (sni=%V): the resolver answered the SNI"
+                              " with this host's address. Fix the"
+                              " \"resolver\" directive -- it must not use"
+                              " a DNS server that hijacks the relayed"
+                              " domains to this VPS IP, otherwise the"
+                              " relay forwards to itself and every client"
+                              " blackholes", &ip, &s->sni);
+            }
+
+            s->up_idx++;
+            continue;
+        }
+
         fd = socket(addr->sa_family, SOCK_DGRAM, 0);
         if (fd == -1) {
             ngx_log_error(NGX_LOG_ALERT, ctx->log, ngx_socket_errno,
@@ -2016,6 +2286,7 @@ ngx_qr_stats(ngx_event_t *ev)
                   " vn=%uL up=%uLpkts/%uLB down=%uLpkts/%uLB"
                   " rebind=%uL missRebound=%uL missDropped=%uL"
                   " missUnknown=%uL missPoisoned=%uL downDrop=%uL"
+                  " loopGuard=%uL selfEcho=%uL"
                   " sniOk=%uL sniFail=%uL"
                   " parseErr=%uL decryptFail=%uL frameErr=%uL",
                   ctx->n_sessions, ctx->conf->max_sessions,
@@ -2024,6 +2295,7 @@ ngx_qr_stats(ngx_event_t *ev)
                   ctx->pkts_down, ctx->bytes_down,
                   ctx->rebinding, ctx->miss_rebound, ctx->miss_dropped,
                   ctx->miss_unknown, ctx->miss_poisoned, ctx->down_drops,
+                  ctx->loop_guard, ctx->self_echo,
                   ctx->sni_ok, ctx->sni_fail,
                   ctx->parse_err, ctx->decrypt_fail, ctx->frame_err);
 
