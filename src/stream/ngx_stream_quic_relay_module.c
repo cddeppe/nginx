@@ -181,6 +181,9 @@ struct ngx_qr_session_s {
     unsigned                    retry_seen:1;
     unsigned                    vn_seen:1;
     unsigned                    destroy_pending:1;
+    unsigned                    flight_logged:1;   /* saw a >=1200B downstream
+                                                   packet (server flight) */
+    unsigned                    no_flight_warned:1; /* one-shot sweep WARN */
 
     /* ClientHello acquisition while no route yet (the CH may span
      * several Initial packets: e.g. post-quantum key shares) */
@@ -261,6 +264,8 @@ typedef struct ngx_qr_ctx_s {
     uint64_t                    miss_poisoned;   /* misses dropped: source is a
                                                    quarantined address */
     uint64_t                    rebinding;
+    uint64_t                    down_drops;      /* downstream sendto() failures
+                                                   (client delivery) */
     uint64_t                    parse_err;
     uint64_t                    decrypt_fail;
     uint64_t                    frame_err;
@@ -294,6 +299,8 @@ static void ngx_qr_rebind_session(ngx_qr_session_t *s, ngx_connection_t *c);
 static void ngx_qr_rebind_known(ngx_qr_session_t *s, ngx_connection_t *c);
 static void ngx_qr_miss_steal(ngx_qr_session_t *s, ngx_connection_t *c);
 static void ngx_qr_close_udp_conn(ngx_connection_t *c);
+static void ngx_qr_log_downstream(ngx_qr_session_t *s, u_char *buf,
+    size_t n);
 
 static void ngx_qr_resolve_handler(ngx_resolver_ctx_t *rctx);
 static ngx_int_t ngx_qr_open_upstream(ngx_qr_session_t *s,
@@ -831,6 +838,18 @@ ngx_qr_init_module(ngx_cycle_t *cycle)
         }
         *lsp = &ls[i];
 
+        /* downstream delivery happens via sendto() on the shared
+         * listen socket; the kernel default sndbuf (~212KB) can
+         * overflow under a video-rate burst, silently dropping QUIC
+         * packets on the last hop.  Raise it (clamped by
+         * net.core.wmem_max). */
+        {
+            int  sndbuf = 8 * 1024 * 1024;
+
+            (void) setsockopt(ls[i].fd, SOL_SOCKET, SO_SNDBUF,
+                              &sndbuf, sizeof(sndbuf));
+        }
+
         ls[i].handler = ngx_qr_new_peer;
 
         ngx_log_error(NGX_LOG_INFO, cycle->log, 0,
@@ -905,10 +924,20 @@ ngx_qr_new_peer(ngx_connection_t *c)
         return;
     }
 
-    ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
-                  "quic_relay: new peer (len %z, port %d)",
-                  c->buffer ? (size_t) (c->buffer->last - c->buffer->pos) : 0,
-                  (int) ngx_inet_get_port(c->sockaddr));
+    {
+        u_char     abuf[NGX_SOCKADDR_STRLEN];
+        ngx_str_t  addr;
+
+        addr.data = abuf;
+        addr.len = ngx_sock_ntop(c->sockaddr, c->socklen, abuf,
+                                 NGX_SOCKADDR_STRLEN, 1);
+
+        ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
+                      "quic_relay: new peer (len %z, %V)",
+                      c->buffer ? (size_t) (c->buffer->last - c->buffer->pos)
+                                : 0,
+                      &addr);
+    }
 
     c->data = NULL;
     c->read->handler = ngx_qr_packet_handler;
@@ -1280,10 +1309,10 @@ ngx_qr_destroy_session(ngx_qr_session_t *s, const char *reason)
     s->destroy_pending = 1;
 
     ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
-                  "quic_relay: session done: sni=%V life=%uis "
+                  "quic_relay: session #%ui done: sni=%V life=%uis "
                   "up=%uLpkts/%uLB down=%uLpkts/%uLB miss=%uL retry=%ui"
                   " reason=%s",
-                  &s->sni,
+                  s->id, &s->sni,
                   (ngx_uint_t) ((ngx_current_msec - s->created) / 1000),
                   s->pkts_up, s->bytes_up, s->pkts_down, s->bytes_down,
                   s->miss_pkts, s->retry_seen, reason);
@@ -1671,9 +1700,10 @@ ngx_qr_connect_upstream(ngx_qr_session_t *s)
             ip.len = ngx_sock_ntop(addr, s->up_socklens[s->up_idx], ipbuf,
                                    NGX_SOCKADDR_STRLEN, 1);
             ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
-                          "quic_relay: upstream fd:%d open for sni=%V -> %V"
-                          " (address %ui of %ui)",
-                          fd, &s->sni, &ip, (ngx_uint_t) s->up_idx + 1,
+                          "quic_relay: upstream fd:%d open (session #%ui)"
+                          " sni=%V -> %V (address %ui of %ui)",
+                          fd, s->id, &s->sni, &ip,
+                          (ngx_uint_t) s->up_idx + 1,
                           (ngx_uint_t) s->n_up);
         }
 
@@ -1703,6 +1733,86 @@ ngx_qr_open_upstream(ngx_qr_session_t *s, struct sockaddr *addr,
     s->up_idx = 0;
 
     return ngx_qr_connect_upstream(s);
+}
+
+
+static void
+ngx_qr_log_downstream(ngx_qr_session_t *s, u_char *buf, size_t n)
+{
+    /* X-ray for the first downstream packet and the first >=1200B
+     * (server flight) packet: decodes the cleartext long header so the
+     * field log answers WHAT the edge actually opened with -- Retry,
+     * Version Negotiation, an ACK-only Handshake, a CONNECTION_CLOSE,
+     * or a short header (stateless reset / 1-RTT).  Previously only
+     * "40 bytes" was visible, which identifies none of these. */
+
+    u_char      desc[128];
+    u_char      hex[64];
+    u_char     *p;
+    size_t      j;
+    uint32_t    version = 0;
+    uint8_t     type = 0, dl = 0, sl = 0;
+    ngx_int_t   is_long;
+
+    is_long = (n > 6 && (buf[0] & 0x80));
+
+    if (is_long) {
+        type = (buf[0] >> 4) & 0x03;
+        version = ((uint32_t) buf[1] << 24) | ((uint32_t) buf[2] << 16)
+                  | ((uint32_t) buf[3] << 8) | buf[4];
+        dl = buf[5];
+        sl = (n > (size_t) (6 + dl)) ? buf[6 + dl] : 0;
+    }
+
+    p = desc;
+
+    if (is_long) {
+        p = ngx_sprintf(p, "long type=%ui dcid_len=%ui scid_len=%ui"
+                        " ver=0x%uxD",
+                        (ngx_uint_t) type, (ngx_uint_t) dl,
+                        (ngx_uint_t) sl, (ngx_uint_t) version);
+
+        if (version == 0) {
+            p = ngx_cpymem(p, " VersionNegotiation", 20);
+        } else {
+            switch (type) {
+            case 0:  p = ngx_cpymem(p, " Initial", 8); break;
+            case 1:  p = ngx_cpymem(p, " 0-RTT", 6); break;
+            case 2:  p = ngx_cpymem(p, " Handshake", 10); break;
+            default: p = ngx_cpymem(p, " RETRY", 6); break;
+            }
+        }
+
+    } else {
+        p = ngx_cpymem(p, "short header (stateless reset or 1-RTT)", 38);
+    }
+
+    *p = '\0';
+
+    if ((size_t) n >= 1200) {
+        s->flight_logged = 1;
+    }
+
+    if (s->pkts_down == 0) {
+        for (j = 0; j < 24 && j < n && 2 * j + 2 < sizeof(hex); j++) {
+            static const u_char  digits[] = "0123456789abcdef";
+
+            hex[2 * j] = digits[buf[j] >> 4];
+            hex[2 * j + 1] = digits[buf[j] & 0x0f];
+        }
+        hex[2 * j] = '\0';
+
+        ngx_log_error(NGX_LOG_INFO, s->ctx->log, 0,
+                      "quic_relay: first downstream packet: %uz bytes"
+                      " (session #%ui, sni=%V, %s, hex=%s)",
+                      n, s->id, &s->sni, desc, hex);
+
+    } else {
+        ngx_log_error(NGX_LOG_INFO, s->ctx->log, 0,
+                      "quic_relay: server flight: %uz bytes"
+                      " (session #%ui, sni=%V, %s)",
+                      n, s->id, &s->sni, desc);
+    }
 }
 
 
@@ -1742,10 +1852,8 @@ ngx_qr_upstream_read(ngx_event_t *ev)
             break;
         }
 
-        if (s->pkts_down == 0) {
-            ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
-                          "quic_relay: first downstream packet: %uz bytes"
-                          " (sni=%V)", (size_t) n, &s->sni);
+        if (s->pkts_down == 0 || ((size_t) n >= 1200 && !s->flight_logged)) {
+            ngx_qr_log_downstream(s, buf, (size_t) n);
         }
 
         if ((size_t) n >= 200) {
@@ -1791,8 +1899,11 @@ ngx_qr_upstream_read(ngx_event_t *ev)
 
         /* deliver to the client via the listen socket */
 
-        (void) sendto(s->client_conn->fd, buf, n, 0,
-                      s->client_addr, s->client_socklen);
+        if (sendto(s->client_conn->fd, buf, n, 0,
+                   s->client_addr, s->client_socklen) == -1)
+        {
+            ctx->down_drops++;
+        }
 
         if (s->spray_until > ngx_current_msec
             && s->old_client_addr != NULL)
@@ -1860,6 +1971,28 @@ ngx_qr_sweep(ngx_event_t *ev)
 
         s = ngx_queue_data(q, ngx_qr_session_t, queue);
 
+        /* one-shot detector: a routed session that never saw a
+         * >=1200B downstream packet (server flight) within 15 s --
+         * the edge is not completing the handshake for us.  This is
+         * the signature the video-session blackhole leaves in INFO
+         * logs that previously only became visible at the 120 s idle
+         * session-done line. */
+
+        if (!s->no_flight_warned && !s->flight_logged
+            && s->upstream_fd != -1
+            && now - s->created > 15000)
+        {
+            s->no_flight_warned = 1;
+            ngx_log_error(NGX_LOG_WARN, ctx->log, 0,
+                          "quic_relay: no server flight in %uis"
+                          " (session #%ui, sni=%V, up=%uLpkts/%uLB,"
+                          " down=%uLpkts/%uLB) -- edge did not complete"
+                          " the handshake",
+                          (ngx_uint_t) ((now - s->created) / 1000),
+                          s->id, &s->sni, s->pkts_up, s->bytes_up,
+                          s->pkts_down, s->bytes_down);
+        }
+
         if (now - s->last_activity > s->conf->timeout) {
             cc = s->client_conn;
             ngx_qr_destroy_session(s, "idle");
@@ -1882,16 +2015,50 @@ ngx_qr_stats(ngx_event_t *ev)
                   "quic_relay: stats: sessions=%ui/%ui initial=%uL retry=%uL"
                   " vn=%uL up=%uLpkts/%uLB down=%uLpkts/%uLB"
                   " rebind=%uL missRebound=%uL missDropped=%uL"
-                  " missUnknown=%uL missPoisoned=%uL sniOk=%uL sniFail=%uL"
+                  " missUnknown=%uL missPoisoned=%uL downDrop=%uL"
+                  " sniOk=%uL sniFail=%uL"
                   " parseErr=%uL decryptFail=%uL frameErr=%uL",
                   ctx->n_sessions, ctx->conf->max_sessions,
                   ctx->initial_seen, ctx->retry_seen, ctx->vn_seen,
                   ctx->pkts_up, ctx->bytes_up,
                   ctx->pkts_down, ctx->bytes_down,
                   ctx->rebinding, ctx->miss_rebound, ctx->miss_dropped,
-                  ctx->miss_unknown, ctx->miss_poisoned, ctx->sni_ok,
-                  ctx->sni_fail, ctx->parse_err, ctx->decrypt_fail,
-                  ctx->frame_err);
+                  ctx->miss_unknown, ctx->miss_poisoned, ctx->down_drops,
+                  ctx->sni_ok, ctx->sni_fail,
+                  ctx->parse_err, ctx->decrypt_fail, ctx->frame_err);
+
+    /* per-session census: makes each session's byte counts visible
+     * every minute WITHOUT waiting for the 120 s idle session-done
+     * line -- the video session's fate (MBs vs KBs downstream) is the
+     * key field signal */
+
+    {
+        ngx_queue_t      *cq;
+        ngx_uint_t        n = 0;
+        ngx_qr_session_t *cs;
+
+        for (cq = ngx_queue_head(&ctx->sessions);
+             cq != ngx_queue_sentinel(&ctx->sessions) && n < 128;
+             cq = ngx_queue_next(cq))
+        {
+            cs = ngx_queue_data(cq, ngx_qr_session_t, queue);
+            n++;
+
+            ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
+                          "quic_relay: census #%ui sni=%V %s age=%uis"
+                          " up=%uLpkts/%uLB down=%uLpkts/%uLB miss=%uL"
+                          " early=%ui crypto=%uz",
+                          cs->id, &cs->sni,
+                          (cs->upstream_fd != -1) ? "active"
+                          : (cs->resolving ? "resolving" : "pending"),
+                          (ngx_uint_t) ((ngx_current_msec - cs->created)
+                                        / 1000),
+                          cs->pkts_up, cs->bytes_up,
+                          cs->pkts_down, cs->bytes_down,
+                          cs->miss_pkts, (ngx_uint_t) cs->n_early,
+                          cs->crypto_len);
+        }
+    }
 
     ngx_add_timer(&ctx->stats_ev, NGX_QR_STATS_INTERVAL);
 }
@@ -2625,9 +2792,9 @@ ngx_qr_try_route(ngx_qr_session_t *s, u_char *data, size_t len,
            == NGX_OK)
     {
         ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
-                      "quic_relay: SNI extracted: %V (crypto %uz bytes,"
-                      " %ui Initials)",
-                      &sni, s->crypto_len,
+                      "quic_relay: SNI extracted: %V (session #%ui,"
+                      " crypto %uz bytes, %ui Initials)",
+                      &sni, s->id, s->crypto_len,
                       (ngx_uint_t) s->initials_seen + 1);
 
         s->sni.data = ngx_pnalloc(s->pool, sni.len);
@@ -2664,6 +2831,16 @@ ngx_qr_try_route(ngx_qr_session_t *s, u_char *data, size_t len,
     }
 
     s->initials_seen++;
+
+    if (s->initials_seen == 4) {
+        /* mid-flight X-ray of pending sessions: which fragments the
+         * client keeps sending while the CH never completes */
+        ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
+                      "quic_relay: still no SNI after %ui Initials"
+                      " (session #%ui, crypto %uz bytes, last \"%s\")",
+                      (ngx_uint_t) s->initials_seen, s->id, s->crypto_len,
+                      ngx_qr_fail);
+    }
 
     if (s->initials_seen < NGX_QR_PENDING_MAX) {
         return;      /* stay pending: more Initials may complete the CH */
