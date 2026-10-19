@@ -1,0 +1,70 @@
+# /etc/nginx/nginx.conf — QUIC relay, standalone VPS mode
+#
+# Drop-in config for a box whose only job is relaying QUIC (HTTP/3) for
+# DNS-hijacked clients.  See /usr/share/doc/nginx-geosite/QUIC-RELAY.md
+# for the full directive reference and the phone field-test protocol.
+#
+# If this nginx also does geosite TCP routing, don't overwrite your
+# nginx.conf — instead copy only the `stream { server { ... } }` block
+# below into your existing config (a second server{} on the same or a
+# different UDP port is fine).
+
+# MUST be 1 for the relay: session state is per-worker, and a migrated
+# packet (new source port) must land on the worker that owns the session.
+worker_processes 1;
+
+error_log /var/log/nginx/error.log info;
+# error_log /var/log/nginx/error.log debug;   # per-packet tracing
+
+pid /run/nginx.pid;
+
+events {
+    worker_connections 4096;
+}
+
+stream {
+
+    server {
+        # The relay listener. Clients send QUIC here (DNS answers with
+        # this box's IP). 443/udp needs CAP_NET_BIND_SERVICE — the
+        # package's systemd unit + setcap already provide it.
+        listen 443 udp;
+
+        # Where Initial SNIs get resolved to real edge IPs.
+        # Use a resolver you trust; valid= caches aggressively which is
+        # fine here (per-session sockets re-resolve on session birth).
+        resolver 8.8.8.8 1.1.1.1 valid=300s;
+
+        quic_relay on;
+
+        # Idle session sweep. 90s default; shorter reaps dead phone
+        # sessions faster, longer rides out long playback pauses.
+        # quic_relay_timeout 90s;
+
+        # Dual-send window after a Cronet-style miss-rebound: for this
+        # long, downstream packets go to both the old and the new client
+        # address. 0 disables.
+        # quic_relay_spray 3s;
+
+        # Concurrent session cap (memory bound).
+        # quic_relay_max_sessions 256;
+
+        # A/B only: 'on' drops never-seen-DCID packets from new ports
+        # (plain-forwarder semantics) and reproduces the YouTube stall.
+        # Keep 'off' in production.
+        # quic_relay_strict_miss off;
+
+        # Optional static upstream for sessions without a usable SNI
+        # (e.g. your nearest Google edge, or another relay).
+        # quic_relay_fallback 203.0.113.7:443;
+    }
+
+    # Optional: let the same nginx handle TCP/443 for the hijacked
+    # domains (terminate or pass through), so fallback traffic doesn't
+    # black-hole while QUIC works:
+    #
+    # server {
+    #     listen 443;
+    #     proxy_pass ...;
+    # }
+}

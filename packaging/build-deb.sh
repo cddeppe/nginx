@@ -155,6 +155,11 @@ if [[ -f "$REPO_ROOT/packaging/nginx.conf.example" ]]; then
     cp "$REPO_ROOT/packaging/nginx.conf.example" \
        "$PKG_ROOT/etc/nginx/nginx.conf.example"
 fi
+# QUIC relay example config (standalone drop-in for a relay VPS)
+if [[ -f "$REPO_ROOT/packaging/quic-relay.conf.example" ]]; then
+    cp "$REPO_ROOT/packaging/quic-relay.conf.example" \
+       "$PKG_ROOT/etc/nginx/quic-relay.conf.example"
+fi
 # Main nginx.conf — only install if user doesn't have one. Use dpkg-conffile
 # to make it a conffile (preserved on upgrade).
 if [[ ! -f "$PKG_ROOT/etc/nginx/nginx.conf" ]] && [[ -f "$REPO_ROOT/packaging/nginx.conf.example" ]]; then
@@ -175,6 +180,8 @@ chmod 755 "$PKG_ROOT/etc/cron.weekly/refresh-geosite"
 
 # Docs
 cp "$REPO_ROOT/GEOSITE.md" "$PKG_ROOT/usr/share/doc/$PKG_NAME/GEOSITE.md"
+[[ -f "$REPO_ROOT/QUIC-RELAY.md" ]] && \
+    cp "$REPO_ROOT/QUIC-RELAY.md" "$PKG_ROOT/usr/share/doc/$PKG_NAME/QUIC-RELAY.md"
 cp "$REPO_ROOT/LICENSE" "$PKG_ROOT/usr/share/doc/$PKG_NAME/copyright" 2>/dev/null || true
 cat > "$PKG_ROOT/usr/share/doc/$PKG_NAME/README" <<EOF
 $PKG_NAME $PKG_VERSION ($ARCH)
@@ -184,6 +191,15 @@ nginx fork with:
     \$geosite_category variable
   - proxy_interface directive: bind upstream socket to a named network
     interface via SO_BINDTODEVICE (Linux)
+  - ngx_stream_quic_relay_module: QUIC-aware UDP relay for DNS-hijack
+    topologies — survives Android/Cronet connection migration
+    (see /usr/share/doc/nginx-geosite/QUIC-RELAY.md)
+
+QUIC relay quickstart:
+  1. sudo cp /etc/nginx/quic-relay.conf.example /etc/nginx/nginx.conf
+  2. sudo nginx -t && sudo systemctl restart nginx
+  3. point DNS for google.com/youtube.com at this box
+  Docs: /usr/share/doc/nginx-geosite/QUIC-RELAY.md
 
 Source: https://github.com/cddeppe/nginx
 Documentation: /usr/share/doc/$PKG_NAME/GEOSITE.md
@@ -218,15 +234,21 @@ Provides: nginx, nginx-http-server, nginx-geosite
 Section: httpd
 Priority: optional
 Homepage: https://github.com/cddeppe/nginx
-Description: nginx fork with geosite.dat routing + per-interface bind (SO_BINDTODEVICE)
- Replaces Xray's geosite: + sockopt.interface routing with native nginx.
+Description: nginx fork with geosite routing, per-interface bind (SO_BINDTODEVICE) and a QUIC relay
+ Replaces Xray's geosite: + sockopt.interface routing with native nginx,
+ and adds a QUIC-aware UDP relay for DNS-hijack topologies.
  .
- Adds two features to the nginx stream module:
+ Adds three features to the nginx stream module:
   * ngx_stream_geosite_module: loads v2ray/xray geosite.dat (protobuf),
     exposes the \$geosite_category variable (e.g. "amazon", "netflix") for
     the current \$ssl_preread_server_name.
   * proxy_interface directive: binds the upstream connection to a named
     network interface (e.g. "wg0") via SO_BINDTODEVICE. Requires CAP_NET_RAW.
+  * ngx_stream_quic_relay_module: plaintext-UDP QUIC relay with per-session
+    connected upstream sockets, Initial SNI extraction for routing, and
+    Cronet migration survival (never-seen-DCID miss-rebound). Enables
+    native HTTP/3 for DNS-hijacked clients (e.g. Android YouTube).
+    Docs: /usr/share/doc/nginx-geosite/QUIC-RELAY.md .
  .
  Together with a map on \$geosite_category, this gives Xray-equivalent
  per-domain routing through WireGuard (or any interface) inside nginx.
@@ -311,7 +333,9 @@ echo "nginx-geosite installed."
 echo "  Binary:  /usr/sbin/nginx"
 echo "  Config:  /etc/nginx/nginx.conf"
 echo "  Docs:    /usr/share/doc/nginx-geosite/GEOSITE.md"
-echo "  Example: /etc/nginx/nginx.conf.example"
+echo "          /usr/share/doc/nginx-geosite/QUIC-RELAY.md"
+echo "  Example: /etc/nginx/nginx.conf.example (geosite routing)"
+echo "           /etc/nginx/quic-relay.conf.example (QUIC relay VPS)"
 echo ""
 echo "Next steps:"
 echo "  1. Edit /etc/nginx/nginx.conf (or: cp /etc/nginx/nginx.conf.example /etc/nginx/nginx.conf)"

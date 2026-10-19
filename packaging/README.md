@@ -11,6 +11,7 @@ the nginx-geosite Debian package (`.deb`) for amd64 and arm64.
 | `build-deb.sh` | Build script — runs `./configure && make && dpkg-deb --build` for the current arch. Used both locally and by CI. |
 | `nginx.service` | systemd unit shipped inside the `.deb`. Includes `AmbientCapabilities=CAP_NET_RAW CAP_NET_BIND_SERVICE`. |
 | `nginx.conf.example` | Example config that ships inside the `.deb` as `/etc/nginx/nginx.conf.example`. Mirrors the Xray routing rules. |
+| `quic-relay.conf.example` | Standalone drop-in config for a QUIC-relay VPS — ships as `/etc/nginx/quic-relay.conf.example`. See `../QUIC-RELAY.md`. |
 | `refresh-geosite` | Cron script (weekly) that refreshes `dlc.dat` and reloads nginx. Installed to `/etc/cron.weekly/refresh-geosite`. |
 | `../.github/workflows/release.yml` | CI workflow that builds both arches on tag push and creates a GitHub Release. |
 
