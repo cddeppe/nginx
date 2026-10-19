@@ -168,13 +168,22 @@ line.
 ## Limitations
 
 - **Single worker per listener** (see above).
-- Miss-rebound uses a most-recent-session heuristic; under *simultaneous*
-  multi-connection bursts from the same client address (new app session
-  while an old one is mid-migration) a rebound could in theory land on the
-  wrong session. Not observed in testing; if it ever shows up, it surfaces
-  as a single failed stream, not a dead client.
-- The Retry (token) path is relayed transparently but not yet covered by a
-  deterministic test; field TBD.
+- Miss-rebound uses a most-recent-session heuristic. It is exact for a
+  single client migrating at a time (the phone case: the migrating
+  client's own session is the busiest right up to the switch).  When two
+  clients behind the same address migrate *in the same instant*, or a
+  client migrates while another session streams at full rate, the miss
+  can land on the wrong session: the migrating client's connection then
+  dies (a foreign edge answers unknown CIDs with stateless resets) and
+  Cronet recovers by opening a fresh connection, while the spray window
+  keeps the hijacked session's real owner alive.  Expect a one-time
+  stall-and-retry, not a dead client.
+- Initials whose header+token exceeds 512 bytes are declined with
+  `ad-too-big` in the log (GFE tokens stay well under that; raise
+  `NGX_QR_AD_MAX` if a future token format grows past it).
+- The Retry (token) path is relayed transparently; Retry detection is
+  counted (`retry=`) but the path is not covered by a deterministic
+  sandbox test yet.
 - 0-RTT packets from a *previous* connection carry old CIDs and are
   treated like any other miss (rebound), which is the desired behavior.
 

@@ -61,6 +61,10 @@
 #define NGX_QR_MAX_UP_ADDRS      8     /* resolver candidates per route */
 #define NGX_QR_CRYPTO_BUF        4096  /* ClientHello reassembly buffer */
 #define NGX_QR_PLAIN_BUF         2048  /* decrypted Initial payload */
+#define NGX_QR_MAX_HOLES         8     /* out-of-order CRYPTO chunks stashed */
+#define NGX_QR_HOLE_MAX          256   /* max stashed CRYPTO chunk (bytes) */
+#define NGX_QR_AD_MAX            512   /* AAD (unprotected header) cap: cached
+                                          retry/new tokens reach 300+ bytes */
 #define NGX_QR_PENDING_MAX       8     /* Initials to wait for the SNI */
 
 /* QUIC v1 initial salt, RFC 9001 section 5.2 */
@@ -105,7 +109,19 @@ typedef struct {
 } ngx_qr_early_t;
 
 
+typedef struct {
+    uint32_t            version;
+    uint64_t            pn;
+    uint64_t            token_len;
+    uint64_t            payload_len;
+    size_t              ad_len;
+} ngx_qr_diag_t;
+
+
 typedef struct ngx_qr_ctx_s  ngx_qr_ctx_t;
+
+
+static ngx_uint_t  ngx_qr_session_serial;
 
 
 struct ngx_qr_session_s {
@@ -166,6 +182,13 @@ struct ngx_qr_session_s {
     uint8_t                     initials_seen;  /* Initials parsed while
                                                    unrouted */
 
+    /* out-of-order CRYPTO stash: chunks that arrived before their
+     * predecessor (multi-Initial ClientHello, reordering) */
+    u_char                     *hole_buf;       /* MAX_HOLES * HOLE_MAX */
+    uint64_t                    hole_off[NGX_QR_MAX_HOLES];
+    size_t                      hole_len[NGX_QR_MAX_HOLES];
+    uint8_t                     decrypt_fail_logged;
+
     /* early packets buffered while resolving */
     ngx_qr_early_t             *early[NGX_QR_MAX_EARLY];
     uint8_t                     n_early;
@@ -179,7 +202,13 @@ struct ngx_qr_session_s {
     uint64_t                    pkts_up, pkts_down;
     uint64_t                    bytes_up, bytes_down;
     uint64_t                    miss_pkts;
+    ngx_msec_t                  last_big_down;   /* last downstream packet
+                                                   >= 200B (real data,
+                                                   not a stateless reset) */
+    ngx_msec_t                  last_client_pkt; /* last packet from the
+                                                   CURRENT client address */
     uint8_t                     resolve_fails;
+    ngx_uint_t                  id;              /* diagnostic serial */
 };
 
 
@@ -215,6 +244,8 @@ typedef struct ngx_qr_ctx_s {
     uint64_t                    miss_unknown;
     uint64_t                    rebinding;
     uint64_t                    parse_err;
+    uint64_t                    decrypt_fail;
+    uint64_t                    frame_err;
     uint64_t                    sni_ok;
     uint64_t                    sni_fail;
     ngx_msec_t                  last_stats;
@@ -270,7 +301,7 @@ static void ngx_qr_register_dcid(ngx_qr_ctx_t *ctx, ngx_qr_session_t *s,
 /* Initial crypto / SNI extraction */
 static ngx_int_t ngx_qr_decrypt_initial(u_char *dcid, uint8_t dcid_len,
     u_char *pkt, size_t pkt_len, u_char *plain, size_t plain_size,
-    size_t *plain_len, ngx_log_t *log);
+    size_t *plain_len, ngx_qr_diag_t *diag, ngx_log_t *log);
 static ngx_int_t ngx_qr_extract_sni(u_char *plain, size_t len,
     ngx_str_t *sni, ngx_log_t *log);
 static ngx_int_t ngx_qr_varint(u_char **p, u_char *end, uint64_t *value);
@@ -279,7 +310,10 @@ static void ngx_qr_try_route(ngx_qr_session_t *s, u_char *data, size_t len,
     u_char *dcid, uint8_t dcid_len);
 static ngx_int_t ngx_qr_collect_crypto(ngx_qr_session_t *s, u_char *plain,
     size_t plain_len);
-
+static ngx_int_t ngx_qr_crypto_append(ngx_qr_session_t *s, u_char *data,
+    uint64_t flen, uint64_t foff);
+static void ngx_qr_crypto_stash(ngx_qr_session_t *s, u_char *data,
+    size_t flen, uint64_t foff);
 static ngx_command_t  ngx_qr_commands[] = {
 
     { ngx_string("quic_relay"),
@@ -794,8 +828,9 @@ ngx_qr_new_peer(ngx_connection_t *c)
     }
 
     ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
-                  "quic_relay: new peer (len %z)",
-                  c->buffer ? (size_t) (c->buffer->last - c->buffer->pos) : 0);
+                  "quic_relay: new peer (len %z, port %d)",
+                  c->buffer ? (size_t) (c->buffer->last - c->buffer->pos) : 0,
+                  (int) ngx_inet_get_port(c->sockaddr));
 
     c->data = NULL;
     c->read->handler = ngx_qr_packet_handler;
@@ -991,9 +1026,15 @@ miss:
         return;
     }
 
-    /* last resort (single-user mode): rebind the most recently active
-     * session — this covers CID rotation + source rebind arriving
-     * together, where the new DCID was never visible in cleartext */
+    /* Last resort: the miss carries a CID issued in encrypted
+     * NEW_CONNECTION_ID frames, invisible to the relay, so the target
+     * session must be inferred.  Heuristic: the most recently active
+     * session -- a migrating client keeps its old path busy right up to
+     * the switch (Cronet path probing), making its own session the
+     * busiest at the moment of the miss.  This is exact for the
+     * sequential single-client case (the phone); simultaneous
+     * migrations of two clients within the same instant remain a known
+     * limitation (documented in QUIC-RELAY.md). */
 
     s2 = NULL;
     {
@@ -1018,7 +1059,8 @@ miss:
         ctx->miss_rebound++;
         ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
                       "quic_relay: miss rebound to most-recent session"
-                      " (dcid unknown, %uz bytes)", len);
+                      " #%ui (dcid unknown, %uz bytes, port %d)",
+                      s2->id, len, (int) ngx_inet_get_port(c->sockaddr));
         ngx_qr_rebind_session(s2, c);
         ngx_qr_forward(s2, data, len);
         return;
@@ -1108,12 +1150,15 @@ ngx_qr_create_session(ngx_connection_t *c, u_char *data, size_t len)
     }
 
     s->created = s->last_activity = ngx_current_msec;
+    s->last_client_pkt = ngx_current_msec;
+    s->id = ++ngx_qr_session_serial;
 
     c->data = s;
 
     ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
-                  "quic_relay: session created, dcid_len=%ui scid_len=%ui",
-                  (ngx_uint_t) dcid_len, (ngx_uint_t) scid_len);
+                  "quic_relay: session #%ui created, dcid_len=%ui"
+                  " scid_len=%ui",
+                  s->id, (ngx_uint_t) dcid_len, (ngx_uint_t) scid_len);
 
     ngx_queue_insert_tail(&ctx->sessions, &s->queue);
     ctx->n_sessions++;
@@ -1178,6 +1223,7 @@ ngx_qr_destroy_session(ngx_qr_session_t *s, const char *reason)
         ngx_rbtree_delete(&ctx->dcid_tree, &s->dcids[i]->node);
     }
 
+
     /* early buffers freed with the pool */
 
     ngx_queue_remove(&s->queue);
@@ -1224,7 +1270,9 @@ ngx_qr_rebind_session(ngx_qr_session_t *s, ngx_connection_t *c)
     c->data = s;
 
     ngx_log_error(NGX_LOG_INFO, s->ctx->log, 0,
-                  "quic_relay: session rebound to new client address");
+                  "quic_relay: session #%ui rebound to new client address"
+                  " (port %d)",
+                  s->id, (int) ngx_inet_get_port(c->sockaddr));
 }
 
 
@@ -1510,6 +1558,13 @@ ngx_qr_upstream_read(ngx_event_t *ev)
                           " (sni=%V)", (size_t) n, &s->sni);
         }
 
+        if ((size_t) n >= 200) {
+            /* big-packet marker: stateless resets from a wrong edge are
+             * small; real response traffic is MTU-sized.  Used by the
+             * miss-trial confirmation. */
+            s->last_big_down = ngx_current_msec;
+        }
+
         ctx->pkts_down++;
         ctx->bytes_down += n;
         s->pkts_down++;
@@ -1565,6 +1620,7 @@ ngx_qr_forward(ngx_qr_session_t *s, u_char *data, size_t len)
     ngx_qr_ctx_t  *ctx = s->ctx;
 
     s->last_activity = ngx_current_msec;
+    s->last_client_pkt = ngx_current_msec;
     ctx->pkts_up++;
     ctx->bytes_up += len;
     s->pkts_up++;
@@ -1636,14 +1692,15 @@ ngx_qr_stats(ngx_event_t *ev)
                   "quic_relay: stats: sessions=%ui/%ui initial=%uL retry=%uL"
                   " vn=%uL up=%uLpkts/%uLB down=%uLpkts/%uLB"
                   " rebind=%uL missRebound=%uL missDropped=%uL"
-                  " missUnknown=%uL sniOk=%uL sniFail=%uL parseErr=%uL",
+                  " missUnknown=%uL sniOk=%uL sniFail=%uL parseErr=%uL"
+                  " decryptFail=%uL frameErr=%uL",
                   ctx->n_sessions, ctx->conf->max_sessions,
                   ctx->initial_seen, ctx->retry_seen, ctx->vn_seen,
                   ctx->pkts_up, ctx->bytes_up,
                   ctx->pkts_down, ctx->bytes_down,
                   ctx->rebinding, ctx->miss_rebound, ctx->miss_dropped,
                   ctx->miss_unknown, ctx->sni_ok, ctx->sni_fail,
-                  ctx->parse_err);
+                  ctx->parse_err, ctx->decrypt_fail, ctx->frame_err);
 
     ngx_add_timer(&ctx->stats_ev, NGX_QR_STATS_INTERVAL);
 }
@@ -1727,7 +1784,9 @@ ngx_qr_parse_long_header(u_char *data, size_t len,
         return NGX_ERROR;
     }
 
-    *type = (data[0] >> 4) & 0x03;
+    *type = (data[0] >> 4) & 0x03;    /* RFC 9000 17.2: type = bits 5-4
+                                          (bit 6 = fixed bit, see
+                                          NGX_QUIC_PKT_HANDSHAKE 0x20) */
 
     p += 1 + 4;                        /* flags + version */
 
@@ -1941,7 +2000,7 @@ ngx_qr_hp_mask(u_char *hp_key, u_char *sample, u_char *mask, ngx_log_t *log)
 static ngx_int_t
 ngx_qr_decrypt_initial(u_char *dcid, uint8_t dcid_len,
     u_char *pkt, size_t pkt_len, u_char *plain, size_t plain_size,
-    size_t *plain_len, ngx_log_t *log)
+    size_t *plain_len, ngx_qr_diag_t *diag, ngx_log_t *log)
 {
     u_char       is[32], client_secret[32], key[NGX_QR_KEY_LEN],
                  iv[NGX_QR_IV_LEN], hp[NGX_QR_KEY_LEN];
@@ -1949,7 +2008,7 @@ ngx_qr_decrypt_initial(u_char *dcid, uint8_t dcid_len,
     u_char      *p, *end, *pn_area, *sample, *ct;
     uint64_t     token_len, payload_len;
     u_char       flags, flags2, mask[NGX_QR_HP_LEN], nonce[NGX_QR_IV_LEN];
-    u_char       ad[128];
+    u_char       ad[NGX_QR_AD_MAX];
     uint64_t     pn = 0;
     size_t       ad_len, ct_len;
     int          pnl, i, outl, total = 0, rc;
@@ -1997,17 +2056,22 @@ ngx_qr_decrypt_initial(u_char *dcid, uint8_t dcid_len,
     flags = *p++;
 
     if ((flags & 0x80) == 0) {
+        ngx_qr_fail = "not-long";
         return NGX_DECLINED;
     }
 
     p += 4;                            /* version */
+    diag->version = ((uint32_t) pkt[1] << 24) | ((uint32_t) pkt[2] << 16)
+                    | ((uint32_t) pkt[3] << 8) | pkt[4];
 
-    if (((flags >> 4) & 0x03) != 0) {
+    if (((flags >> 4) & 0x03) != 0) {  /* type = bits 5-4 (0x30 mask) */
+        ngx_qr_fail = "not-initial";   /* 0-RTT / Handshake / Retry */
         return NGX_DECLINED;           /* not an Initial packet */
     }
 
     dl = *p++;
     if (dl != dcid_len) {
+        ngx_qr_fail = "dcid-len";
         return NGX_DECLINED;
     }
     p += dl;
@@ -2027,11 +2091,13 @@ ngx_qr_decrypt_initial(u_char *dcid, uint8_t dcid_len,
         return NGX_DECLINED;
     }
     p += (size_t) token_len;
+    diag->token_len = token_len;
 
     if (ngx_qr_varint(&p, end, &payload_len) != NGX_OK) {
         ngx_qr_fail = "len-varint";
         return NGX_DECLINED;
     }
+    diag->payload_len = payload_len;
 
     pn_area = p;
 
@@ -2054,6 +2120,7 @@ ngx_qr_decrypt_initial(u_char *dcid, uint8_t dcid_len,
 
     sample = pn_area + 4;
     if (end - sample < 16) {
+        ngx_qr_fail = "sample-short";
         return NGX_DECLINED;
     }
 
@@ -2070,10 +2137,14 @@ ngx_qr_decrypt_initial(u_char *dcid, uint8_t dcid_len,
         pn = (pn << 8) | (pn_area[i] ^ mask[1 + i]);
     }
 
+    diag->pn = pn;
+
     /* 4. build the associated data (unprotected header incl. pn field) */
 
     ad_len = (size_t) (pn_area - pkt) + pnl;
+    diag->ad_len = ad_len;
     if (ad_len > sizeof(ad)) {
+        ngx_qr_fail = "ad-too-big";    /* header+token > NGX_QR_AD_MAX */
         return NGX_DECLINED;
     }
 
@@ -2096,14 +2167,19 @@ ngx_qr_decrypt_initial(u_char *dcid, uint8_t dcid_len,
     ct = pn_area + pnl;
     ct_len = (size_t) (end - ct);
 
-    if (ct_len <= NGX_QR_TAG_LEN
-        || ct_len - NGX_QR_TAG_LEN > plain_size)
-    {
+    if (ct_len <= NGX_QR_TAG_LEN) {
+        ngx_qr_fail = "ct-short";
+        return NGX_DECLINED;
+    }
+
+    if (ct_len - NGX_QR_TAG_LEN > plain_size) {
+        ngx_qr_fail = "plain-overflow";
         return NGX_DECLINED;
     }
 
     cctx = EVP_CIPHER_CTX_new();
     if (cctx == NULL) {
+        ngx_qr_fail = "evp-alloc";
         return NGX_DECLINED;
     }
 
@@ -2151,7 +2227,7 @@ static ngx_int_t
 ngx_qr_extract_sni(u_char *stream, size_t len, ngx_str_t *sni,
     ngx_log_t *log)
 {
-    u_char    *p, *ch, *ch_end;
+    u_char    *p, *ch, *ch_end, *c;
     uint64_t   hs_len, ext_type, ext_len;
     uint64_t   sni_list_len, name_type, name_len;
     uint64_t   sid_len, cs_len, cm_len;
@@ -2258,6 +2334,19 @@ ngx_qr_extract_sni(u_char *stream, size_t len, ngx_str_t *sni,
             sni->data = q;
             sni->len = (size_t) name_len;
 
+            /* charset sanity: a real SNI is [A-Za-z0-9.-] only.  A
+             * mis-reassembled buffer must never become a resolve target
+             * ("www.youtube.c\xNN\xNN" must not reach the resolver). */
+            for (c = q; c < q + name_len; c++) {
+                if (!((*c >= 'a' && *c <= 'z')
+                      || (*c >= 'A' && *c <= 'Z')
+                      || (*c >= '0' && *c <= '9')
+                      || *c == '.' || *c == '-'))
+                {
+                    QR_SNI_FAIL("sni-charset");
+                }
+            }
+
             return NGX_OK;
         }
 
@@ -2286,6 +2375,7 @@ ngx_qr_try_route(ngx_qr_session_t *s, u_char *data, size_t len,
     ngx_resolver_ctx_t  *rctx;
     ngx_qr_ctx_t        *ctx = s->ctx;
     ngx_qr_srv_conf_t   *conf = s->conf;
+    ngx_qr_diag_t        diag;
 
     if (!conf->sni || ctx->resolver == NULL) {
         goto fallback;
@@ -2303,8 +2393,11 @@ ngx_qr_try_route(ngx_qr_session_t *s, u_char *data, size_t len,
         return;
     }
 
+    ngx_memzero(&diag, sizeof(ngx_qr_diag_t));
+
     if (ngx_qr_decrypt_initial(dcid, dcid_len, data, len, s->plainbuf,
-                               NGX_QR_PLAIN_BUF, &plain_len, ctx->log)
+                               NGX_QR_PLAIN_BUF, &plain_len, &diag,
+                               ctx->log)
         == NGX_OK)
     {
         ngx_log_error(NGX_LOG_DEBUG, ctx->log, 0,
@@ -2312,6 +2405,28 @@ ngx_qr_try_route(ngx_qr_session_t *s, u_char *data, size_t len,
                       plain_len);
 
         (void) ngx_qr_collect_crypto(s, s->plainbuf, plain_len);
+
+    } else {
+        /* every decline reason is now visible: this was the blind spot
+         * that hid token-carrying Initials (AAD > 128) in the field */
+        ctx->decrypt_fail++;
+
+        if (s->decrypt_fail_logged < 3) {
+            s->decrypt_fail_logged++;
+            ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
+                          "quic_relay: initial decrypt failed (%s):"
+                          " ver=0x%uxD pn=%uL token=%uL adlen=%uz"
+                          " payload=%uL dgram=%uz dcid_len=%ui",
+                          ngx_qr_fail, (ngx_uint_t) diag.version, diag.pn,
+                          diag.token_len, diag.ad_len, diag.payload_len,
+                          len, (ngx_uint_t) dcid_len);
+        } else {
+            ngx_log_error(NGX_LOG_DEBUG, ctx->log, 0,
+                          "quic_relay: initial decrypt failed (%s):"
+                          " ver=0x%uxD pn=%uL token=%uL adlen=%uz",
+                          ngx_qr_fail, (ngx_uint_t) diag.version, diag.pn,
+                          diag.token_len, diag.ad_len);
+        }
     }
 
     if (s->crypto_len > 0
@@ -2387,7 +2502,6 @@ ngx_qr_collect_crypto(ngx_qr_session_t *s, u_char *plain, size_t plain_len)
 {
     u_char    *p = plain, *end = plain + plain_len;
     uint64_t   ftype, foff, flen, v1, v2, v3, v4;
-    size_t     chunk;
 
     while (p < end) {
 
@@ -2402,7 +2516,8 @@ ngx_qr_collect_crypto(ngx_qr_session_t *s, u_char *plain, size_t plain_len)
 
         if (ftype == 0x02 || ftype == 0x03) {
             /* ACK: Largest(v) Delay(v) RangeCount(v) FirstRange(v)
-             *      + RangeCount * (Gap(v) + Range(v)) */
+             *      + RangeCount * (Gap(v) + Range(v))
+             * ACK_ECN appends ECT0(v) ECT1(v) CE(v) */
             if (ngx_qr_varint(&p, end, &v1) != NGX_OK
                 || ngx_qr_varint(&p, end, &v2) != NGX_OK
                 || ngx_qr_varint(&p, end, &v3) != NGX_OK
@@ -2414,6 +2529,15 @@ ngx_qr_collect_crypto(ngx_qr_session_t *s, u_char *plain, size_t plain_len)
             for ( ; v3 > 0; v3--) {
                 if (ngx_qr_varint(&p, end, &v1) != NGX_OK
                     || ngx_qr_varint(&p, end, &v2) != NGX_OK)
+                {
+                    return NGX_ERROR;
+                }
+            }
+
+            if (ftype == 0x03) {
+                if (ngx_qr_varint(&p, end, &v1) != NGX_OK
+                    || ngx_qr_varint(&p, end, &v2) != NGX_OK
+                    || ngx_qr_varint(&p, end, &v4) != NGX_OK)
                 {
                     return NGX_ERROR;
                 }
@@ -2431,43 +2555,136 @@ ngx_qr_collect_crypto(ngx_qr_session_t *s, u_char *plain, size_t plain_len)
                 return NGX_ERROR;
             }
 
-            if (foff <= (uint64_t) s->crypto_len
-                && foff + flen > (uint64_t) s->crypto_len)
-            {
-                chunk = (size_t) (foff + flen - s->crypto_len);
+            if (foff <= (uint64_t) s->crypto_len) {
 
-                if (chunk > NGX_QR_CRYPTO_BUF - s->crypto_len) {
-                    chunk = NGX_QR_CRYPTO_BUF - s->crypto_len;
+                if (foff + flen > (uint64_t) s->crypto_len) {
+                    /* extends the contiguous prefix: append in place,
+                     * then drain any stash that just became contiguous */
+                    (void) ngx_qr_crypto_append(s, p, flen, foff);
                 }
+                /* else: pure duplicate of what we already have */
 
-                ngx_memcpy(s->crypto + s->crypto_len,
-                           p + (size_t) ((uint64_t) s->crypto_len - foff),
-                           chunk);
-                s->crypto_len += chunk;
+            } else if (flen <= NGX_QR_HOLE_MAX
+                       && foff < NGX_QR_CRYPTO_BUF)
+            {
+                /* future offset: hold it until the gap is filled */
+                ngx_qr_crypto_stash(s, p, (size_t) flen, foff);
             }
 
             p += (size_t) flen;
             continue;
         }
 
-        if (ftype < 0x40) {                 /* generic: Length(v) */
-            if (ngx_qr_varint(&p, end, &flen) != NGX_OK
-                || (uint64_t) (end - p) < flen)
+        if (ftype == 0x1c) {                /* CONNECTION_CLOSE:
+                                               Error(v) FrameType(v)
+                                               ReasonLen(v) Reason */
+            if (ngx_qr_varint(&p, end, &v1) != NGX_OK
+                || ngx_qr_varint(&p, end, &v2) != NGX_OK
+                || ngx_qr_varint(&p, end, &v3) != NGX_OK
+                || (uint64_t) (end - p) < v3)
             {
                 return NGX_ERROR;
             }
-
-            p += (size_t) flen;
+            p += (size_t) v3;
             continue;
         }
 
-        /* frames with embedded lengths (>= 0x40) do not appear in
-         * client Initials in practice */
+        /* Only PADDING, PING, ACK, ACK_ECN, CRYPTO and CONNECTION_CLOSE
+         * are legal in client Initials (RFC 9001 section 4.6).  Anything
+         * else means we lost frame sync (or a non-Initial slipped in):
+         * stop walking instead of guessing a length and mis-reassembling
+         * CRYPTO data at bogus offsets.  Frames already collected stay
+         * valid. */
 
+        s->ctx->frame_err++;
         return NGX_ERROR;
     }
 
     return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_qr_crypto_append(ngx_qr_session_t *s, u_char *data, uint64_t flen,
+    uint64_t foff)
+{
+    size_t     chunk;
+    uint64_t   i, n;
+
+    /* append the tail of [foff, foff+flen) that extends crypto_len */
+
+    chunk = (size_t) (foff + flen - (uint64_t) s->crypto_len);
+    if (chunk > (size_t) (NGX_QR_CRYPTO_BUF - s->crypto_len)) {
+        chunk = NGX_QR_CRYPTO_BUF - s->crypto_len;
+    }
+
+    ngx_memcpy(s->crypto + s->crypto_len,
+               data + (size_t) ((uint64_t) s->crypto_len - foff),
+               chunk);
+    s->crypto_len += chunk;
+
+    /* drain stashed out-of-order chunks that are now contiguous */
+
+    for ( ;; ) {
+        n = (uint64_t) s->crypto_len;
+
+        for (i = 0; i < NGX_QR_MAX_HOLES; i++) {
+            if (s->hole_len[i] == 0) {
+                continue;
+            }
+
+            if (s->hole_off[i] <= n
+                && s->hole_off[i] + s->hole_len[i] > n)
+            {
+                chunk = (size_t) (s->hole_off[i] + s->hole_len[i] - n);
+                if (chunk > (size_t) (NGX_QR_CRYPTO_BUF - s->crypto_len)) {
+                    chunk = NGX_QR_CRYPTO_BUF - s->crypto_len;
+                }
+
+                ngx_memcpy(s->crypto + s->crypto_len,
+                           s->hole_buf + i * NGX_QR_HOLE_MAX
+                           + (size_t) (n - s->hole_off[i]),
+                           chunk);
+                s->crypto_len += chunk;
+                s->hole_len[i] = 0;
+                break;              /* rescan from the first slot */
+            }
+        }
+
+        if ((uint64_t) s->crypto_len == n) {
+            break;                  /* nothing more is contiguous */
+        }
+    }
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_qr_crypto_stash(ngx_qr_session_t *s, u_char *data, size_t flen,
+    uint64_t foff)
+{
+    size_t   i;
+
+    if (s->hole_buf == NULL) {
+        s->hole_buf = ngx_palloc(s->pool,
+                                 NGX_QR_MAX_HOLES * NGX_QR_HOLE_MAX);
+        if (s->hole_buf == NULL) {
+            return;
+        }
+    }
+
+    for (i = 0; i < NGX_QR_MAX_HOLES; i++) {
+        if (s->hole_len[i] == 0) {
+            s->hole_off[i] = foff;
+            s->hole_len[i] = flen;
+            ngx_memcpy(s->hole_buf + i * NGX_QR_HOLE_MAX, data, flen);
+            return;
+        }
+    }
+
+    /* no free slot: the chunk is dropped; the prefix parse still
+     * succeeds as long as the SNI lies inside the contiguous part */
 }
 
 
