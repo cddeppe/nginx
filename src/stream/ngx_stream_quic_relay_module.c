@@ -363,6 +363,11 @@ struct ngx_qr_session_s {
 
     /* stats */
     uint64_t                    pkts_up, pkts_down;
+    uint64_t                    pkts_up_big, pkts_down_big;  /* >=1200B:
+                                                   MTU-sized packets (Initial
+                                                   flights, handshake certs,
+                                                   data) vs small control
+                                                   packets (ACKs, resets) */
     uint64_t                    bytes_up, bytes_down;
     uint64_t                    miss_pkts;
     ngx_msec_t                  last_big_down;   /* last downstream packet
@@ -409,6 +414,7 @@ typedef struct ngx_qr_ctx_s {
     uint64_t                    sessions_closed;
     uint64_t                    sessions_evicted;
     uint64_t                    pkts_up, pkts_down;
+    uint64_t                    pkts_up_big, pkts_down_big;
     uint64_t                    bytes_up, bytes_down;
     uint64_t                    miss_rebound;
     uint64_t                    miss_dropped;
@@ -1553,11 +1559,12 @@ ngx_qr_destroy_session(ngx_qr_session_t *s, const char *reason)
 
     ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
                   "quic_relay: session #%ui done: sni=%V life=%uis "
-                  "up=%uLpkts/%uLB down=%uLpkts/%uLB miss=%uL retry=%ui"
-                  " reason=%s",
+                  "up=%uLpkts/%uLB bigU=%uL down=%uLpkts/%uLB bigD=%uL"
+                  " miss=%uL retry=%ui reason=%s",
                   s->id, &s->sni,
                   (ngx_uint_t) ((ngx_current_msec - s->created) / 1000),
-                  s->pkts_up, s->bytes_up, s->pkts_down, s->bytes_down,
+                  s->pkts_up, s->bytes_up, s->pkts_up_big,
+                  s->pkts_down, s->bytes_down, s->pkts_down_big,
                   s->miss_pkts, s->retry_seen, reason);
 
     /* pending async resolution */
@@ -2137,6 +2144,10 @@ ngx_qr_upstream_read(ngx_event_t *ev)
         ctx->bytes_down += n;
         s->pkts_down++;
         s->bytes_down += n;
+        if ((size_t) n >= 1200) {
+            ctx->pkts_down_big++;
+            s->pkts_down_big++;
+        }
         s->last_activity = ngx_current_msec;
 
         /* learn + register server CIDs from long headers */
@@ -2196,6 +2207,10 @@ ngx_qr_forward(ngx_qr_session_t *s, u_char *data, size_t len)
     ctx->bytes_up += len;
     s->pkts_up++;
     s->bytes_up += len;
+    if (len >= 1200) {
+        ctx->pkts_up_big++;
+        s->pkts_up_big++;
+    }
 
     if (s->upstream_fd != -1) {
         (void) send(s->upstream_fd, data, len, 0);
@@ -2283,7 +2298,8 @@ ngx_qr_stats(ngx_event_t *ev)
 
     ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
                   "quic_relay: stats: sessions=%ui/%ui initial=%uL retry=%uL"
-                  " vn=%uL up=%uLpkts/%uLB down=%uLpkts/%uLB"
+                  " vn=%uL up=%uLpkts/%uLB bigUp=%uL down=%uLpkts/%uLB"
+                  " bigDown=%uL"
                   " rebind=%uL missRebound=%uL missDropped=%uL"
                   " missUnknown=%uL missPoisoned=%uL downDrop=%uL"
                   " loopGuard=%uL selfEcho=%uL"
@@ -2291,8 +2307,8 @@ ngx_qr_stats(ngx_event_t *ev)
                   " parseErr=%uL decryptFail=%uL frameErr=%uL",
                   ctx->n_sessions, ctx->conf->max_sessions,
                   ctx->initial_seen, ctx->retry_seen, ctx->vn_seen,
-                  ctx->pkts_up, ctx->bytes_up,
-                  ctx->pkts_down, ctx->bytes_down,
+                  ctx->pkts_up, ctx->bytes_up, ctx->pkts_up_big,
+                  ctx->pkts_down, ctx->bytes_down, ctx->pkts_down_big,
                   ctx->rebinding, ctx->miss_rebound, ctx->miss_dropped,
                   ctx->miss_unknown, ctx->miss_poisoned, ctx->down_drops,
                   ctx->loop_guard, ctx->self_echo,
@@ -2318,15 +2334,15 @@ ngx_qr_stats(ngx_event_t *ev)
 
             ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
                           "quic_relay: census #%ui sni=%V %s age=%uis"
-                          " up=%uLpkts/%uLB down=%uLpkts/%uLB miss=%uL"
-                          " early=%ui crypto=%uz",
+                          " up=%uLpkts/%uLB bigU=%uL down=%uLpkts/%uLB"
+                          " bigD=%uL miss=%uL early=%ui crypto=%uz",
                           cs->id, &cs->sni,
                           (cs->upstream_fd != -1) ? "active"
                           : (cs->resolving ? "resolving" : "pending"),
                           (ngx_uint_t) ((ngx_current_msec - cs->created)
                                         / 1000),
-                          cs->pkts_up, cs->bytes_up,
-                          cs->pkts_down, cs->bytes_down,
+                          cs->pkts_up, cs->bytes_up, cs->pkts_up_big,
+                          cs->pkts_down, cs->bytes_down, cs->pkts_down_big,
                           cs->miss_pkts, (ngx_uint_t) cs->n_early,
                           cs->crypto_len);
         }

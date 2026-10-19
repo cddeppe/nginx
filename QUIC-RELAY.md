@@ -150,6 +150,7 @@ quic_relay: stats: sessions=3/256 initial=41 retry=2 vn=0
 | `sessions` | live sessions / configured max |
 | `initial` / `retry` / `vn` | client Initials seen / Retry packets relayed / version-negotiation |
 | `up` / `down` | packets+bytes client→edge / edge→client |
+| `bigUp` / `bigDown` | of those, packets **≥1200 B** (Initial flights, handshake certs, data) — a session whose `bigD` stops growing at ~1-2 never got the server flight; ~8-10 then stops = handshake completed but data starved; steadily growing = data flowing (if slowly, check the path, not the relay) |
 | `rebind` | NAT-style rebinds (new port, known DCID) |
 | `missRebound` | **Cronet-signature misses absorbed** (new port, unknown DCID) — on a phone field test this is the number that proves the wall is crossed |
 | `missDropped` | misses dropped (`strict_miss on`, no session yet, or quarantined source) |
