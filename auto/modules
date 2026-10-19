@@ -1346,6 +1346,19 @@ if [ $STREAM != NO ]; then
 
         . auto/module
     fi
+
+    # ngx_stream_quic_relay_module — QUIC-aware UDP relay for DNS-hijack
+    # topologies: per-session upstream sockets, DCID index, Initial SNI
+    # decryption for routing, migration/rebind miss handling.
+    if [ $STREAM = YES ]; then
+        ngx_module_name=ngx_stream_quic_relay_module
+        ngx_module_deps=
+        ngx_module_srcs=src/stream/ngx_stream_quic_relay_module.c
+        ngx_module_libs=
+        ngx_module_link=YES
+
+        . auto/module
+    fi
 fi
 
 
