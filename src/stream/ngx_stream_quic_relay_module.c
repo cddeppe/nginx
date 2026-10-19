@@ -66,6 +66,11 @@
 #define NGX_QR_AD_MAX            512   /* AAD (unprotected header) cap: cached
                                           retry/new tokens reach 300+ bytes */
 #define NGX_QR_PENDING_MAX       8     /* Initials to wait for the SNI */
+#define NGX_QR_POISON_SLOTS      4     /* quarantined miss-steal addresses */
+#define NGX_QR_POISON_TTL        60000 /* ms: quarantine after a rolled-back
+                                          miss steal (stale/foreign conn) */
+#define NGX_QR_STEAL_GRACE       3000  /* ms: a miss rebind stays tentative
+                                          (spray window) unless reclaimed */
 
 /* QUIC v1 initial salt, RFC 9001 section 5.2 */
 static const u_char  ngx_qr_initial_salt[NGX_QR_SALT_LEN] = {
@@ -138,6 +143,9 @@ struct ngx_qr_session_s {
     struct sockaddr            *old_client_addr;  /* -> old_sa, spray target */
     socklen_t                   old_client_socklen;
     ngx_msec_t                  spray_until;
+    ngx_msec_t                  stolen_until;   /* > now: client_addr was set
+                                                   by a miss steal and has not
+                                                   been reclaimed yet */
 
     /* upstream side */
     ngx_socket_t                upstream_fd;
@@ -226,6 +234,14 @@ typedef struct ngx_qr_ctx_s {
     /* per-listen socket registry (built in init_module) */
     ngx_array_t                 listens;  /* ngx_listening_t* */
 
+    /* addresses whose miss steal was rolled back by the session's real
+     * owner: stale connections orphaned by a worker restart, or foreign
+     * stray traffic.  Their unknown-DCID misses must not steal sessions
+     * again for the quarantine window. */
+    ngx_sockaddr_t              poison_sa[NGX_QR_POISON_SLOTS];
+    socklen_t                   poison_len[NGX_QR_POISON_SLOTS];
+    ngx_msec_t                  poison_until[NGX_QR_POISON_SLOTS];
+
     /* timers */
     ngx_event_t                 sweep_ev;
     ngx_event_t                 stats_ev;
@@ -242,6 +258,8 @@ typedef struct ngx_qr_ctx_s {
     uint64_t                    miss_rebound;
     uint64_t                    miss_dropped;
     uint64_t                    miss_unknown;
+    uint64_t                    miss_poisoned;   /* misses dropped: source is a
+                                                   quarantined address */
     uint64_t                    rebinding;
     uint64_t                    parse_err;
     uint64_t                    decrypt_fail;
@@ -273,6 +291,8 @@ static ngx_qr_session_t *ngx_qr_create_session(ngx_connection_t *c,
 static void ngx_qr_destroy_session(ngx_qr_session_t *s,
     const char *reason);
 static void ngx_qr_rebind_session(ngx_qr_session_t *s, ngx_connection_t *c);
+static void ngx_qr_rebind_known(ngx_qr_session_t *s, ngx_connection_t *c);
+static void ngx_qr_miss_steal(ngx_qr_session_t *s, ngx_connection_t *c);
 static void ngx_qr_close_udp_conn(ngx_connection_t *c);
 
 static void ngx_qr_resolve_handler(ngx_resolver_ctx_t *rctx);
@@ -616,6 +636,64 @@ ngx_qr_register_dcid(ngx_qr_ctx_t *ctx, ngx_qr_session_t *s,
     ctx->cid_len_mask |= 1u << cid_len;
 }
 
+
+static ngx_int_t
+ngx_qr_poison_check(ngx_qr_ctx_t *ctx, struct sockaddr *sa, socklen_t len)
+{
+    ngx_uint_t  i;
+
+    for (i = 0; i < NGX_QR_POISON_SLOTS; i++) {
+        if (ctx->poison_until[i] > ngx_current_msec
+            && ctx->poison_len[i] == len
+            && ngx_cmp_sockaddr(sa, len,
+                                (struct sockaddr *) &ctx->poison_sa[i],
+                                ctx->poison_len[i], 1) == 0)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+static void
+ngx_qr_poison_add(ngx_qr_ctx_t *ctx, struct sockaddr *sa, socklen_t len)
+{
+    ngx_uint_t  i, victim;
+    ngx_msec_t  oldest;
+
+    for (i = 0; i < NGX_QR_POISON_SLOTS; i++) {
+        if (ctx->poison_len[i] == len
+            && ngx_cmp_sockaddr(sa, len,
+                                (struct sockaddr *) &ctx->poison_sa[i],
+                                ctx->poison_len[i], 1) == 0)
+        {
+            ctx->poison_until[i] = ngx_current_msec + NGX_QR_POISON_TTL;
+            return;                     /* already quarantined: refresh */
+        }
+    }
+
+    victim = 0;
+    oldest = NGX_MAX_INT_T_VALUE;
+
+    for (i = 0; i < NGX_QR_POISON_SLOTS; i++) {
+        if (ctx->poison_until[i] <= ngx_current_msec) {
+            victim = i;
+            break;                      /* free / expired slot */
+        }
+
+        if (ctx->poison_until[i] < oldest) {
+            oldest = ctx->poison_until[i];
+            victim = i;
+        }
+    }
+
+    ngx_memcpy(&ctx->poison_sa[victim], sa, len);
+    ctx->poison_len[victim] = len;
+    ctx->poison_until[victim] = ngx_current_msec + NGX_QR_POISON_TTL;
+}
+
 /* ---------------------------------------------------------------------- */
 /* module init: patch ls->handler for udp listen sockets of enabled servers */
 
@@ -934,7 +1012,7 @@ ngx_qr_process_client_packet(ngx_connection_t *c, u_char *data, size_t len)
             if (s == NULL && s2 != NULL) {
                 /* re-Initial after a rebind: DCID still known */
                 ctx->rebinding++;
-                ngx_qr_rebind_session(s2, c);
+                ngx_qr_rebind_known(s2, c);
                 s = s2;
                 same = 1;
             }
@@ -973,7 +1051,7 @@ ngx_qr_process_client_packet(ngx_connection_t *c, u_char *data, size_t len)
         s2 = ngx_qr_lookup_dcid(ctx, dcid, dcid_len);
         if (s2 != NULL) {
             ctx->rebinding++;
-            ngx_qr_rebind_session(s2, c);
+            ngx_qr_rebind_known(s2, c);
             ngx_qr_forward(s2, data, len);
             return;
         }
@@ -1005,7 +1083,7 @@ ngx_qr_process_client_packet(ngx_connection_t *c, u_char *data, size_t len)
             s2 = ngx_qr_lookup_dcid(ctx, &data[1], l);
             if (s2 != NULL) {
                 ctx->rebinding++;
-                ngx_qr_rebind_session(s2, c);
+                ngx_qr_rebind_known(s2, c);
                 ngx_qr_forward(s2, data, len);
                 return;
             }
@@ -1023,6 +1101,21 @@ miss:
         ngx_log_debug1(NGX_LOG_DEBUG_EVENT, ctx->log, 0,
                        "quic_relay: dropped unknown-source packet"
                        " (%uz bytes)", len);
+        return;
+    }
+
+    /* A quarantined address (its earlier miss steal was rolled back by
+     * the session's real owner) must not steal again: these are stale
+     * connections orphaned by a worker restart, or foreign stray
+     * traffic.  Dropping their misses is what keeps a newborn session
+     * alive through the post-restart retransmission storm. */
+
+    if (ngx_qr_poison_check(ctx, c->sockaddr, c->socklen)) {
+        ctx->miss_poisoned++;
+        ctx->miss_dropped++;
+        ngx_log_debug1(NGX_LOG_DEBUG_EVENT, ctx->log, 0,
+                       "quic_relay: dropped quarantined miss (%uz bytes)",
+                       len);
         return;
     }
 
@@ -1055,13 +1148,7 @@ miss:
     }
 
     if (s2 != NULL) {
-        s2->miss_pkts++;
-        ctx->miss_rebound++;
-        ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
-                      "quic_relay: miss rebound to most-recent session"
-                      " #%ui (dcid unknown, %uz bytes, port %d)",
-                      s2->id, len, (int) ngx_inet_get_port(c->sockaddr));
-        ngx_qr_rebind_session(s2, c);
+        ngx_qr_miss_steal(s2, c);
         ngx_qr_forward(s2, data, len);
         return;
     }
@@ -1147,6 +1234,13 @@ ngx_qr_create_session(ngx_connection_t *c, u_char *data, size_t len)
         s->initial_dcid_len = dcid_len;
         ngx_memcpy(s->client_dcid, scid, scid_len);
         s->client_dcid_len = scid_len;
+
+        /* The Initial DCID must be searchable: a retransmitted Initial
+         * arriving on a fresh conn (e.g. after a miss steal closed the
+         * old one) must roll the session back to its real client
+         * instead of spawning an orphan duplicate session with a second
+         * upstream to the same server. */
+        ngx_qr_register_dcid(ctx, s, dcid, dcid_len);
     }
 
     s->created = s->last_activity = ngx_current_msec;
@@ -1273,6 +1367,102 @@ ngx_qr_rebind_session(ngx_qr_session_t *s, ngx_connection_t *c)
                   "quic_relay: session #%ui rebound to new client address"
                   " (port %d)",
                   s->id, (int) ngx_inet_get_port(c->sockaddr));
+}
+
+
+static void
+ngx_qr_rebind_known(ngx_qr_session_t *s, ngx_connection_t *c)
+{
+    u_char     ipbuf[NGX_SOCKADDR_STRLEN];
+    ngx_str_t  ip;
+
+    if (s->client_conn == c) {
+        return;
+    }
+
+    /* A KNOWN-attribution packet (DCID-index hit or re-Initial) is
+     * reclaiming the session while an unknown-DCID miss had tentatively
+     * stolen it away.  The steal target is not this session's owner: it
+     * is a stale connection orphaned by a worker restart, or another
+     * client's stray traffic.  Quarantine the stealing address so its
+     * next miss cannot steal this (or any other) session again; the
+     * rebind below then returns the session to its real client. */
+
+    if (s->stolen_until > ngx_current_msec) {
+        ip.data = ipbuf;
+        ip.len = ngx_sock_ntop(s->client_addr, s->client_socklen, ipbuf,
+                               NGX_SOCKADDR_STRLEN, 1);
+
+        ngx_qr_poison_add(s->ctx, s->client_addr, s->client_socklen);
+
+        ngx_log_error(NGX_LOG_INFO, s->ctx->log, 0,
+                      "quic_relay: miss steal rolled back by known-DCID"
+                      " packet; quarantining %V for %uis (stale or foreign"
+                      " connection)",
+                      &ip, (ngx_uint_t) (NGX_QR_POISON_TTL / 1000));
+    }
+
+    s->stolen_until = 0;
+
+    ngx_qr_rebind_session(s, c);
+}
+
+
+static void
+ngx_qr_miss_steal(ngx_qr_session_t *s, ngx_connection_t *c)
+{
+    ngx_msec_t       grace;
+    ngx_qr_ctx_t    *ctx = s->ctx;
+    ngx_sockaddr_t   keep_sa;
+    socklen_t        keep_socklen = 0;
+    ngx_msec_t       keep_spray_until = 0;
+    ngx_int_t        keep;
+
+    /* Steal chain guard: when a session that is already tentative (its
+     * current address came from an earlier miss steal, with no
+     * known-DCID reclaim in between) is stolen AGAIN, the spray anchor
+     * must stay on the session's last KNOWN address (the real client),
+     * not re-chain to the previous stealing address.  Otherwise two
+     * back-to-back steals orphan the real client completely: no
+     * current-address delivery, no spray coverage, no ACKs, no
+     * rollback -- a steal deadlock that starves the connection. */
+
+    keep = (s->stolen_until > ngx_current_msec
+            && s->old_client_addr != NULL);
+
+    if (keep) {
+        ngx_memcpy(&keep_sa, s->old_client_addr, s->old_client_socklen);
+        keep_socklen = s->old_client_socklen;
+        keep_spray_until = s->spray_until;
+    }
+
+    s->miss_pkts++;
+    ctx->miss_rebound++;
+    ngx_log_error(NGX_LOG_INFO, ctx->log, 0,
+                  "quic_relay: miss rebound to most-recent session"
+                  " #%ui (dcid unknown, port %d)",
+                  s->id, (int) ngx_inet_get_port(c->sockaddr));
+
+    ngx_qr_rebind_session(s, c);
+
+    if (keep) {
+        ngx_memcpy(&s->old_sa, &keep_sa, keep_socklen);
+        s->old_client_addr = (struct sockaddr *) &s->old_sa;
+        s->old_client_socklen = keep_socklen;
+        if (keep_spray_until > s->spray_until) {
+            s->spray_until = keep_spray_until;
+        }
+    }
+
+    /* the rebind is tentative: the spray window keeps the real client
+     * alive, and a known-DCID packet from it will roll the session back
+     * and quarantine the stealing address */
+
+    grace = s->conf->spray_time;
+    if (grace < NGX_QR_STEAL_GRACE) {
+        grace = NGX_QR_STEAL_GRACE;
+    }
+    s->stolen_until = ngx_current_msec + grace;
 }
 
 
@@ -1692,15 +1882,16 @@ ngx_qr_stats(ngx_event_t *ev)
                   "quic_relay: stats: sessions=%ui/%ui initial=%uL retry=%uL"
                   " vn=%uL up=%uLpkts/%uLB down=%uLpkts/%uLB"
                   " rebind=%uL missRebound=%uL missDropped=%uL"
-                  " missUnknown=%uL sniOk=%uL sniFail=%uL parseErr=%uL"
-                  " decryptFail=%uL frameErr=%uL",
+                  " missUnknown=%uL missPoisoned=%uL sniOk=%uL sniFail=%uL"
+                  " parseErr=%uL decryptFail=%uL frameErr=%uL",
                   ctx->n_sessions, ctx->conf->max_sessions,
                   ctx->initial_seen, ctx->retry_seen, ctx->vn_seen,
                   ctx->pkts_up, ctx->bytes_up,
                   ctx->pkts_down, ctx->bytes_down,
                   ctx->rebinding, ctx->miss_rebound, ctx->miss_dropped,
-                  ctx->miss_unknown, ctx->sni_ok, ctx->sni_fail,
-                  ctx->parse_err, ctx->decrypt_fail, ctx->frame_err);
+                  ctx->miss_unknown, ctx->miss_poisoned, ctx->sni_ok,
+                  ctx->sni_fail, ctx->parse_err, ctx->decrypt_fail,
+                  ctx->frame_err);
 
     ngx_add_timer(&ctx->stats_ev, NGX_QR_STATS_INTERVAL);
 }

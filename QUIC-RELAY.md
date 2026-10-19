@@ -141,7 +141,7 @@ Every 60 s a stats line is emitted:
 ```text
 quic_relay: stats: sessions=3/256 initial=41 retry=2 vn=0
     up=12041pkts/812KB down=18732pkts/262MB
-    rebind=7 missRebound=21 missDropped=0 missUnknown=0
+    rebind=7 missRebound=21 missDropped=0 missUnknown=0 missPoisoned=0
     sniOk=41 sniFail=0 parseErr=0
 ```
 
@@ -152,8 +152,39 @@ quic_relay: stats: sessions=3/256 initial=41 retry=2 vn=0
 | `up` / `down` | packets+bytes client→edge / edge→client |
 | `rebind` | NAT-style rebinds (new port, known DCID) |
 | `missRebound` | **Cronet-signature misses absorbed** (new port, unknown DCID) — on a phone field test this is the number that proves the wall is crossed |
-| `missDropped` | misses dropped (only nonzero with `strict_miss on`, or when no session exists) |
+| `missDropped` | misses dropped (`strict_miss on`, no session yet, or quarantined source) |
+| `missPoisoned` | misses dropped because the source address is **quarantined** — a stale/foreign connection whose earlier miss steal was rolled back by the real owner (see below) |
 | `sniOk` / `sniFail` / `parseErr` | SNI extraction outcomes |
+
+## Miss-steal quarantine (the post-restart blackhole defense)
+
+Every relay (re)start orphans all live QUIC connections behind it: their
+server-issued CIDs died with the old worker, so their 1-RTT retransmissions
+arrive as unknown-DCID misses. Under the old most-recent heuristic each such
+miss could *steal* a freshly born session's client address — including a
+video connection mid-handshake, whose ServerHello flight then went to a
+dead port: thumbnails (TCP) kept working, video played zero seconds.
+
+The defense has three parts:
+
+1. **Tentative steal + spray anchor.** A miss steal still rebinds the
+   most-recent session (the migration absorption is untouched), but it is
+   marked tentative and the downstream spray stays anchored to the
+   session's last *known* address — even across a chain of steals — so the
+   real client keeps receiving data and can reclaim the session.
+2. **Rollback.** A known-DCID packet (DCID-index hit, Handshake/0-RTT or
+   re-Initial) from the real client rebinds the session back. The
+   retransmitted Initial of a stolen session now rolls it back instead of
+   spawning an orphan duplicate (the session's Initial DCID is indexed at
+   creation).
+3. **Quarantine.** The rollback of a live steal quarantines the stealing
+   address for 60 s: its further misses are dropped (`missPoisoned`).
+   A legitimate migration never triggers this — the migrating client's old
+   path is gone, so no rollback ever happens.
+
+Field signature: `quic_relay: miss steal rolled back by known-DCID packet;
+quarantining 1.2.3.4:5678 for 60s (stale or foreign connection)` followed by
+`missPoisoned>0` in the stats line. Videos must play through the storm.
 
 ## Field test (phone)
 
@@ -171,13 +202,18 @@ line.
 - Miss-rebound uses a most-recent-session heuristic. It is exact for a
   single client migrating at a time (the phone case: the migrating
   client's own session is the busiest right up to the switch).  When two
-  clients behind the same address migrate *in the same instant*, or a
-  client migrates while another session streams at full rate, the miss
-  can land on the wrong session: the migrating client's connection then
-  dies (a foreign edge answers unknown CIDs with stateless resets) and
-  Cronet recovers by opening a fresh connection, while the spray window
-  keeps the hijacked session's real owner alive.  Expect a one-time
-  stall-and-retry, not a dead client.
+  clients behind the same address migrate *in the same instant*, the miss
+  can land on the wrong session; the steal is tentative (spray keeps the
+  real owner alive) and the rollback reclaims it, so expect a one-time
+  stall-and-retry, not a dead client.  An address whose steal gets rolled
+  back is quarantined and can no longer steal any session for 60 s.
+- A session whose traffic is entirely invisible-CID (aggressive
+  NEW_CONNECTION_ID rotation) has no known-DCID rollbacks; a concurrent
+  miss storm then degrades it (downstream alternates between addresses
+  while the spray covers both) instead of being cleanly quarantined.
+  QUIC loss recovery keeps the connection alive; Cronet's early traffic
+  (Handshake/0-RTT with the server SCID) always provides known-DCID
+  attribution, so this only affects long-lived rotated connections.
 - Initials whose header+token exceeds 512 bytes are declined with
   `ad-too-big` in the log (GFE tokens stay well under that; raise
   `NGX_QR_AD_MAX` if a future token format grows past it).
