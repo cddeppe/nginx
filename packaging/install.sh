@@ -144,7 +144,7 @@ download_latest_deb() {
     # Unauthenticated calls are rate-limited to 60/hour per IP — usually fine
     # for end users, but a CI runner sharing an IP could hit the limit.
     if [[ -n "${GH_TOKEN:-}" ]]; then
-        release_json="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$GITHUB_API")"
+        release_json="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$GITHUB_API" 2>/dev/null || true)"
     else
         release_json="$(curl -fsSL "$GITHUB_API" 2>/dev/null || true)"
     fi
@@ -158,7 +158,7 @@ download_latest_deb() {
         local latest_tag
         latest_tag="$(curl -fsSL "https://github.com/$GITHUB_REPO/releases/latest" \
                        -o /dev/null -w '%{url_effective}' | \
-                       sed 's|.*/tag/||; s|%2B|+|g')"
+                       sed 's|.*/tag/||; s|%2B|+|g' || true)"
         if [[ -z "$latest_tag" || "$latest_tag" == "https://github.com/$GITHUB_REPO/releases" ]]; then
             die "Could not determine latest release tag. Check https://github.com/$GITHUB_REPO/releases"
         fi
@@ -167,7 +167,7 @@ download_latest_deb() {
     else
         # Extract .deb URL for this arch from the JSON.
         # The URL contains URL-encoded '+' as '%2B' — keep it as-is, wget handles it.
-        deb_url="$(echo "$release_json" | grep -oE "https://[^\"]*_${arch}\.deb" | head -1)"
+        deb_url="$(echo "$release_json" | grep -oE "https://[^\"]*_${arch}\.deb" | head -1 || true)"
         if [[ -z "$deb_url" ]]; then
             die "No .deb found for arch=$arch in latest release. Check https://github.com/$GITHUB_REPO/releases"
         fi
@@ -192,7 +192,9 @@ install_deb() {
     # conffile prompt that happens when dpkg tries to --configure the
     # broken package as part of the new install.
     local pkg_state
-    pkg_state=$(dpkg -l nginx-geosite 2>/dev/null | awk '/^i/ {print $1}' | head -1)
+    # NB: dpkg -l exits 1 when the package is unknown (fresh systems);
+    # `|| true` keeps set -euo pipefail from aborting the script here.
+    pkg_state=$(dpkg -l nginx-geosite 2>/dev/null | awk '/^i/ {print $1}' | head -1 || true)
     if [[ "$pkg_state" =~ ^(iF|iU|iH|iW|iT)$ ]]; then
         log "Existing nginx-geosite is in broken state ($pkg_state) — purging and reinstalling"
 
@@ -213,8 +215,10 @@ install_deb() {
 
     # Install with dpkg directly, forcing --force-confold at the dpkg level
     # (not via apt-get, which has its own conffile handling that's flaky).
-    # Then run apt-get install -f to resolve any missing dependencies.
-    DEBIAN_FRONTEND=noninteractive dpkg -i --force-confold --force-confdef --force-depends "$deb_path" 2>&1 | tail -10
+    # dpkg -i may exit non-zero on missing dependencies — that's expected;
+    # apt-get install -f below resolves them, so `|| true` keeps set -e
+    # from aborting before the fallback runs.
+    DEBIAN_FRONTEND=noninteractive dpkg -i --force-confold --force-confdef --force-depends "$deb_path" 2>&1 | tail -10 || true
 
     # Fix any missing dependencies
     if ! dpkg -l nginx-geosite 2>/dev/null | grep -q '^ii'; then
