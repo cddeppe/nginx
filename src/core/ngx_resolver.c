@@ -4629,7 +4629,7 @@ ngx_udp_connect(ngx_resolver_connection_t *rec)
             goto failed;
         }
 
-        ngx_log_error(NGX_LOG_INFO, &rec->log, 0,
+        ngx_log_error(NGX_LOG_DEBUG, &rec->log, 0,
                       "resolver: SO_BINDTODEVICE(\"%s\") applied on UDP socket "
                       "to DNS server %V",
                       rec->resolver->interface, &rec->server);
@@ -4637,10 +4637,12 @@ ngx_udp_connect(ngx_resolver_connection_t *rec)
 #endif
 
     /* Log whether interface binding was applied or not — helps diagnose
-     * DNS leaks where the resolver is NOT going through the tunnel. */
+     * DNS leaks where the resolver is NOT going through the tunnel.
+     * DEBUG, not INFO: this fires on every resolver (re)connect, which
+     * for resolvers without interface= is every one of them. */
     if (rec->resolver == NULL || rec->resolver->interface_len == 0)
     {
-        ngx_log_error(NGX_LOG_INFO, &rec->log, 0,
+        ngx_log_error(NGX_LOG_DEBUG, &rec->log, 0,
                       "resolver: NO interface binding — DNS query to %V goes "
                       "via default route (NOT through any tunnel)",
                       &rec->server);

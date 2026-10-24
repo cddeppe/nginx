@@ -2155,7 +2155,7 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
                                 b->pos = p;
                                 b->last = p;
 
-                                ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                                ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
                                               "stream proxy buffer grown "
                                               "to %uz bytes", size);
                             }
@@ -2185,7 +2185,7 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
                             b->pos = b->start;
                             b->last = b->start;
 
-                            ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                            ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
                                           "stream proxy buffer shrunk "
                                           "to %uz bytes", size);
 
@@ -2200,7 +2200,7 @@ ngx_stream_proxy_process(ngx_stream_session_t *s, ngx_uint_t from_upstream,
                                 b->pos = p;
                                 b->last = p;
 
-                                ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                                ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
                                               "stream proxy buffer shrunk "
                                               "to %uz bytes", size);
                             }
