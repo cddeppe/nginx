@@ -76,42 +76,29 @@ stream {
     access_log /var/log/nginx/nginx-access.log basic buffer=256k flush=5s;
 
     # -------------------------------------------------------------------
-    # 2. Backend selection (edit to match your setup)
-    # -------------------------------------------------------------------
-    map $ssl_preread_server_name $target_backend {
-        # nas.deppe.cc                      "$ssl_preread_server_name:3064";
-        default                           "$ssl_preread_server_name:$server_port";
-    }
-
-    # -------------------------------------------------------------------
-    # 3. Geosite → egress interface (Xray outboundTag equivalent)
-    #    Multiple keys may share one value in a single entry.
+    # 2. Routing, map 1 of 2: geosite category → egress interface
+    #    (Xray outboundTag equivalent). Multiple keys may share one
+    #    value in a single entry.
     # -------------------------------------------------------------------
     map $geosite_category $geosite_iface {
-        default                    off;
+        default                    off;   # off = no bind, main routing table
         amazon hulu disney netflix ak;     # wg-quick interface name
     }
 
     # -------------------------------------------------------------------
-    # 4. Bare-domain overrides (Xray "domain:" rules)
-    #    Regex keys can be combined the same way.
+    # 3. Routing, map 2 of 2: SNI overrides → final egress interface
+    #    (Xray "domain:" rules). Regex keys can be combined the same
+    #    way; the default falls back to the geosite decision above.
+    #    This one variable drives proxy_interface below.
     # -------------------------------------------------------------------
-    map $ssl_preread_server_name $domain_override {
+    map $ssl_preread_server_name $final_iface {
         default                                            $geosite_iface;
         ~*^(.+\.)?intuit\.com$ ~*^(.+\.)?intuitcdn\.net$  ak;
         ~*^dns\.controld\.com$                             off;   # direct
     }
 
     # -------------------------------------------------------------------
-    # 5. Final egress decision
-    # -------------------------------------------------------------------
-    map $domain_override $final_iface {
-        ""      $geosite_iface;
-        default $domain_override;
-    }
-
-    # -------------------------------------------------------------------
-    # 6. Shared server defaults — set once at stream{} level, inherited
+    # 4. Shared server defaults — set once at stream{} level, inherited
     #    by every server{} below (no need to repeat them per server).
     # -------------------------------------------------------------------
     tcp_nodelay             on;
@@ -127,10 +114,12 @@ stream {
     resolver 127.0.0.1 [::1] ipv4=on ipv6=on valid=30s;
 
     # -------------------------------------------------------------------
-    # 7. Main TLS-passthrough proxy (edit IPs to match your server)
+    # 5. Main TLS-passthrough proxy (edit IPs to match your server)
     #    Only the per-server specifics live here: listen address list,
-    #    ssl_preread, proxy_pass — the shared settings are inherited
-    #    from the stream{} block above.
+    #    ssl_preread, proxy_interface, proxy_pass — the shared settings
+    #    are inherited from the stream{} block above. proxy_pass uses
+    #    the SNI and port variables directly, so no passthrough map is
+    #    needed.
     # -------------------------------------------------------------------
     server {
         # Multiple specific addresses in one directive (one socket each,
@@ -145,11 +134,11 @@ stream {
         # Empty / "off" → no bind (use main routing table).
         proxy_interface $final_iface;
 
-        proxy_pass $target_backend;
+        proxy_pass $ssl_preread_server_name:$server_port;
     }
 
     # -------------------------------------------------------------------
-    # 8. Example NAS port forwards (uncomment + edit to match your setup)
+    # 6. Example NAS port forwards (uncomment + edit to match your setup)
     #    A variable default passes unknown ports through unchanged, so
     #    only the remapped ports need explicit entries.
     # -------------------------------------------------------------------
