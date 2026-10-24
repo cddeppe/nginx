@@ -4103,6 +4103,220 @@ ngx_http_core_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 }
 
 
+static ngx_uint_t
+ngx_http_core_listen_addrs(ngx_conf_t *cf, ngx_str_t *values,
+    ngx_uint_t nelts, ngx_url_t *u)
+{
+    ngx_url_t   tu;
+    ngx_str_t   url;
+    ngx_str_t  *parts;
+    ngx_addr_t *addrs, *merged;
+    u_char     *p, *last, *buf;
+    ngx_uint_t  i, j, k, n, nparts, naddrs, total;
+    ngx_uint_t  cur_comma, nxt_comma, nxt_addr;
+
+    /*
+     * The "listen" directive accepts a comma-separated address list:
+     *
+     *     listen 10.0.0.1:443, 10.0.0.2:443, [::1]:443 reuseport;
+     *
+     * The list is expanded into one listening socket per address, all
+     * sharing the options of the directive, exactly as if the addresses
+     * had been given on separate "listen" directives.  Addresses must be
+     * explicit (addr:port); a wildcard cannot be combined into a list.
+     *
+     * The config tokenizer splits a list written with spaces after the
+     * commas into several arguments; join them back before splitting.
+     *
+     * Returns the number of arguments consumed by the address list,
+     * or 0 on error.
+     */
+
+    k = 1;
+    total = values[1].len;
+
+    for ( ;; ) {
+        if (k >= nelts - 1) {
+            break;
+        }
+
+        cur_comma = (values[k].len > 0
+                     && values[k].data[values[k].len - 1] == ',');
+
+        nxt_comma = (values[k + 1].len > 0
+                     && values[k + 1].data[0] == ',');
+
+        nxt_addr = 0;
+
+        for (j = 0; j < values[k + 1].len; j++) {
+            if (values[k + 1].data[j] == ':') {
+                nxt_addr = 1;
+                break;
+            }
+        }
+
+        if (!nxt_comma && !(cur_comma && nxt_addr)) {
+            break;
+        }
+
+        k++;
+        total += values[k].len;
+    }
+
+    if (k == 1) {
+        url = values[1];
+
+    } else {
+        buf = ngx_palloc(cf->pool, total);
+        if (buf == NULL) {
+            return 0;
+        }
+
+        p = buf;
+
+        for (i = 1; i <= k; i++) {
+            p = ngx_cpymem(p, values[i].data, values[i].len);
+        }
+
+        url.data = buf;
+        url.len = total;
+    }
+
+    u->url = url;
+
+    nparts = 1;
+
+    for (i = 0; i < url.len; i++) {
+        if (url.data[i] == ',') {
+            nparts++;
+        }
+    }
+
+    if (nparts == 1) {
+        if (ngx_parse_url(cf->pool, u) != NGX_OK) {
+            if (u->err) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "%s in \"%V\" of the \"listen\" directive",
+                                   u->err, &u->url);
+            }
+
+            return 0;
+        }
+
+        return k;
+    }
+
+    parts = ngx_palloc(cf->pool, nparts * sizeof(ngx_str_t));
+    if (parts == NULL) {
+        return 0;
+    }
+
+    n = 0;
+    parts[0].data = url.data;
+    parts[0].len = 0;
+
+    for (i = 0; i < url.len; i++) {
+
+        if (url.data[i] == ',') {
+            n++;
+            parts[n].data = url.data + i + 1;
+            parts[n].len = 0;
+
+        } else {
+            parts[n].len++;
+        }
+    }
+
+    for (j = 0; j < nparts; j++) {
+        p = parts[j].data;
+        last = p + parts[j].len;
+
+        while (p < last && *p == ' ') {
+            p++;
+        }
+
+        while (p < last && *(last - 1) == ' ') {
+            last--;
+        }
+
+        parts[j].data = p;
+        parts[j].len = last - p;
+
+        if (parts[j].len == 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "empty address in the \"listen\" "
+                               "list \"%V\"", &url);
+            return 0;
+        }
+    }
+
+    naddrs = 0;
+    addrs = NULL;
+
+    for (j = 0; j < nparts; j++) {
+
+        ngx_memzero(&tu, sizeof(ngx_url_t));
+
+        tu.url = parts[j];
+        tu.listen = 1;
+        tu.default_port = u->default_port;
+
+        if (ngx_parse_url(cf->pool, &tu) != NGX_OK) {
+            if (tu.err) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "%s in \"%V\" of the \"listen\" directive",
+                                   tu.err, &tu.url);
+            }
+
+            return 0;
+        }
+
+        if (tu.wildcard) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "a wildcard address \"%V\" cannot be used in "
+                               "a comma-separated \"listen\" list",
+                               &parts[j]);
+            return 0;
+        }
+
+        if (tu.naddrs == 0) {
+            continue;
+        }
+
+        if (naddrs == 0) {
+            addrs = tu.addrs;
+            naddrs = tu.naddrs;
+            continue;
+        }
+
+        merged = ngx_palloc(cf->pool,
+                            (naddrs + tu.naddrs) * sizeof(ngx_addr_t));
+        if (merged == NULL) {
+            return 0;
+        }
+
+        ngx_memcpy(merged, addrs, naddrs * sizeof(ngx_addr_t));
+        ngx_memcpy(merged + naddrs, tu.addrs, tu.naddrs * sizeof(ngx_addr_t));
+
+        addrs = merged;
+        naddrs += tu.naddrs;
+    }
+
+    if (naddrs == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "no addresses in the \"listen\" list \"%V\"",
+                           &url);
+        return 0;
+    }
+
+    u->addrs = addrs;
+    u->naddrs = naddrs;
+    u->wildcard = 0;
+
+    return k;
+}
+
+
 static char *
 ngx_http_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -4119,17 +4333,11 @@ ngx_http_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     ngx_memzero(&u, sizeof(ngx_url_t));
 
-    u.url = value[1];
     u.listen = 1;
     u.default_port = 80;
 
-    if (ngx_parse_url(cf->pool, &u) != NGX_OK) {
-        if (u.err) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "%s in \"%V\" of the \"listen\" directive",
-                               u.err, &u.url);
-        }
-
+    i = ngx_http_core_listen_addrs(cf, value, cf->args->nelts, &u);
+    if (i == 0) {
         return NGX_CONF_ERROR;
     }
 
@@ -4151,7 +4359,7 @@ ngx_http_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     backlog = 0;
 
-    for (n = 2; n < cf->args->nelts; n++) {
+    for (n = i + 1; n < cf->args->nelts; n++) {
 
         if (ngx_strcmp(value[n].data, "default_server") == 0
             || ngx_strcmp(value[n].data, "default") == 0)
