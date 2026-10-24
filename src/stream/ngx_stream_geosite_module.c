@@ -37,10 +37,13 @@
  *     (a warning is emitted at load time).
  *
  * Memory model:
- *   All structures are allocated from cf->cycle->pool at config-parse time,
- *   so they are inherited by worker processes via fork() (copy-on-write).
- *   There is no per-worker re-loading. Reloads require `nginx -s reload`,
- *   which triggers a fresh config parse.
+ *   Final hash tables, category tags and plain-domain lists live in
+ *   cf->cycle->pool and are inherited by worker processes via fork()
+ *   (copy-on-write).  The raw file buffer and the per-domain lowercase
+ *   key copies are allocated from a temporary pool that is destroyed
+ *   after the hashes are built.  There is no per-worker re-loading.
+ *   Reloads require `nginx -s reload`, which triggers a fresh config
+ *   parse.
  *
  * Author: cddeppe/nginx fork
  */
@@ -138,13 +141,14 @@ static ngx_int_t ngx_stream_geosite_variable(ngx_stream_session_t *s,
 
 static ngx_int_t ngx_stream_geosite_load_file(ngx_conf_t *cf,
     ngx_stream_geosite_main_conf_t *gmcf);
-static ngx_int_t ngx_stream_geosite_parse_buf(ngx_conf_t *cf, u_char *buf,
-    u_char *end, ngx_stream_geosite_main_conf_t *gmcf);
+static ngx_int_t ngx_stream_geosite_parse_buf(ngx_conf_t *cf,
+    ngx_pool_t *parse_pool, u_char *buf, u_char *end,
+    ngx_stream_geosite_main_conf_t *gmcf);
 static ngx_int_t ngx_stream_geosite_build_hashes(ngx_conf_t *cf,
     ngx_stream_geosite_main_conf_t *gmcf);
 
 /* protobuf helpers */
-static ngx_uint_t ngx_pb_read_varint(u_char **p, u_char *end);
+static ngx_int_t ngx_pb_read_varint(u_char **p, u_char *end, ngx_uint_t *out);
 static u_char    *ngx_pb_read_len(u_char **p, u_char *end, size_t *len);
 static ngx_int_t  ngx_pb_skip_field(u_char **p, u_char *end, ngx_uint_t wire);
 
@@ -233,25 +237,37 @@ ngx_module_t  ngx_stream_geosite_module = {
 /* Protobuf wire-format helpers                                       */
 /* ------------------------------------------------------------------ */
 
-static ngx_uint_t
-ngx_pb_read_varint(u_char **p, u_char *end)
+/*
+ * Read a base-128 varint.  Truncation (continuation bit at the end of
+ * the buffer) and values that do not fit ngx_uint_t are reported as
+ * NGX_ERROR instead of silently returning 0 — callers could not
+ * distinguish that from a real 0, and a truncated file parsed
+ * "successfully" with its tail entries silently dropped.  The shift
+ * is capped at the width of ngx_uint_t before use, avoiding the
+ * undefined shift behavior on 32-bit builds.
+ */
+static ngx_int_t
+ngx_pb_read_varint(u_char **p, u_char *end, ngx_uint_t *out)
 {
     ngx_uint_t  value = 0;
     int         shift = 0;
     u_char      c;
 
     while (*p < end) {
+        if (shift >= (int) (sizeof(ngx_uint_t) * 8)) {
+            return NGX_ERROR;  /* does not fit ngx_uint_t */
+        }
+
         c = *(*p)++;
         value |= (ngx_uint_t) (c & 0x7F) << shift;
         if (!(c & 0x80)) {
-            return value;
+            *out = value;
+            return NGX_OK;
         }
         shift += 7;
-        if (shift >= 64) {
-            return 0;  /* overflow */
-        }
     }
-    return 0;
+
+    return NGX_ERROR;  /* truncated: continuation bit at end of buffer */
 }
 
 
@@ -260,7 +276,9 @@ ngx_pb_read_len(u_char **p, u_char *end, size_t *len)
 {
     ngx_uint_t  n;
 
-    n = ngx_pb_read_varint(p, end);
+    if (ngx_pb_read_varint(p, end, &n) != NGX_OK) {
+        return NULL;
+    }
 
     /*
      * Compare as a count, never as a pointer: "*p + n" can wrap around
@@ -283,11 +301,14 @@ static ngx_int_t
 ngx_pb_skip_field(u_char **p, u_char *end, ngx_uint_t wire)
 {
     size_t      len;
+    ngx_uint_t  n;
     u_char     *new_end;
 
     switch (wire) {
     case NGX_PB_WIRE_VARINT:
-        ngx_pb_read_varint(p, end);
+        if (ngx_pb_read_varint(p, end, &n) != NGX_OK) {
+            return NGX_ERROR;
+        }
         return NGX_OK;
 
     case NGX_PB_WIRE_FIXED64:
@@ -404,6 +425,7 @@ ngx_stream_geosite_load_file(ngx_conf_t *cf,
     ngx_fd_t     fd;
     ngx_file_t   file;
     ngx_err_t    err;
+    ngx_pool_t  *parse_pool;
 
     if (gmcf->file_path == NULL) {
         return NGX_OK;
@@ -430,8 +452,21 @@ ngx_stream_geosite_load_file(ngx_conf_t *cf,
     size = (size_t) ngx_file_size(&file.info);
     ngx_close_file(fd);
 
-    buf = ngx_palloc(cf->cycle->pool, size);
+    /*
+     * Parse-time allocations (the raw file buffer and the per-domain
+     * lowercase key copies) go into a dedicated pool that is destroyed
+     * once the final hash tables are built — ngx_hash_init() copies
+     * key bytes into the cycle pool, so keeping them forever just
+     * pinned resident memory on the order of the file size.
+     */
+    parse_pool = ngx_create_pool(ngx_pagesize, cf->log);
+    if (parse_pool == NULL) {
+        return NGX_ERROR;
+    }
+
+    buf = ngx_palloc(parse_pool, size);
     if (buf == NULL) {
+        ngx_destroy_pool(parse_pool);
         return NGX_ERROR;
     }
 
@@ -463,11 +498,15 @@ ngx_stream_geosite_load_file(ngx_conf_t *cf,
         return NGX_ERROR;
     }
 
-    if (ngx_stream_geosite_parse_buf(cf, buf, buf + size, gmcf) != NGX_OK) {
+    if (ngx_stream_geosite_parse_buf(cf, parse_pool, buf, buf + size, gmcf)
+        != NGX_OK)
+    {
+        ngx_destroy_pool(parse_pool);
         return NGX_ERROR;
     }
 
     if (ngx_stream_geosite_build_hashes(cf, gmcf) != NGX_OK) {
+        ngx_destroy_pool(parse_pool);
         return NGX_ERROR;
     }
 
@@ -487,6 +526,8 @@ ngx_stream_geosite_load_file(ngx_conf_t *cf,
                            gmcf->categories->nelts, total);
     }
 
+    ngx_destroy_pool(parse_pool);
+
     return NGX_OK;
 }
 
@@ -501,13 +542,13 @@ ngx_stream_geosite_load_file(ngx_conf_t *cf,
  *   domain_keys  - keys array to populate (Domain type)
  */
 static ngx_int_t
-ngx_stream_geosite_parse_domain(ngx_conf_t *cf,
+ngx_stream_geosite_parse_domain(ngx_conf_t *cf, ngx_pool_t *parse_pool,
     u_char *p, u_char *end,
     ngx_stream_geosite_category_t *cat,
     ngx_hash_keys_arrays_t *full_keys,
     ngx_hash_keys_arrays_t *domain_keys)
 {
-    ngx_uint_t   field_no, wire;
+    ngx_uint_t   field_no, wire, tag;
     ngx_uint_t   type = NGX_GEOSITE_TYPE_PLAIN;  /* default per proto3 */
     ngx_str_t    value = ngx_null_string;
     u_char      *str_end;
@@ -517,12 +558,20 @@ ngx_stream_geosite_parse_domain(ngx_conf_t *cf,
     u_char      *lower;
 
     while (p < end) {
-        wire = ngx_pb_read_varint(&p, end);
-        field_no = wire >> 3;
-        wire &= 0x07;
+        if (ngx_pb_read_varint(&p, end, &tag) != NGX_OK) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "geosite: truncated Domain message tag");
+            return NGX_ERROR;
+        }
+        field_no = tag >> 3;
+        wire = tag & 0x07;
 
         if (field_no == NGX_GEOSITE_DOMAIN_FIELD_TYPE && wire == NGX_PB_WIRE_VARINT) {
-            type = ngx_pb_read_varint(&p, end);
+            if (ngx_pb_read_varint(&p, end, &type) != NGX_OK) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "geosite: truncated Domain type varint");
+                return NGX_ERROR;
+            }
             continue;
         }
 
@@ -548,8 +597,10 @@ ngx_stream_geosite_parse_domain(ngx_conf_t *cf,
         return NGX_OK;  /* skip empty entries */
     }
 
-    /* lowercase a copy of value in cycle->pool */
-    lower = ngx_pnalloc(cf->cycle->pool, value.len);
+    /* lowercase a copy of value in the parse pool: ngx_hash_init()
+     * copies key bytes into the final tables, so these copies can be
+     * released once the hashes are built. */
+    lower = ngx_pnalloc(parse_pool, value.len);
     if (lower == NULL) {
         return NGX_ERROR;
     }
@@ -618,109 +669,131 @@ ngx_stream_geosite_parse_domain(ngx_conf_t *cf,
 
 
 /*
- * Walk a GeoSite message body once: collect country code AND parse each
- * Domain sub-message in a single pass.
+ * Walk a GeoSite message in two passes: first locate the country code
+ * (field 1), then parse the Domain entries (field 2).  Protobuf does
+ * not guarantee field order — v2fly's serializer emits country_code
+ * first, but the wire format allows Domain entries to precede it, and
+ * the previous single-pass version silently dropped those.
  */
 static ngx_int_t
-ngx_stream_geosite_process_geosite(ngx_conf_t *cf,
+ngx_stream_geosite_process_geosite(ngx_conf_t *cf, ngx_pool_t *parse_pool,
     u_char *p, u_char *end,
-    ngx_stream_geosite_main_conf_t *gmcf,
-    ngx_stream_geosite_category_t **out_cat)
+    ngx_stream_geosite_main_conf_t *gmcf)
 {
-    ngx_uint_t                       field_no, wire;
+    ngx_uint_t                       field_no, wire, tag;
     ngx_str_t                        country_code = ngx_null_string;
     u_char                          *str_end;
     size_t                           len;
-    ngx_stream_geosite_category_t   *cat = NULL;
+    ngx_stream_geosite_category_t   *cat;
     ngx_hash_keys_arrays_t          *full_keys, *domain_keys;
     ngx_str_t                       *filter_tag;
     ngx_uint_t                       i, matched;
-    u_char                          *dom_body, *dom_end;
+    u_char                          *q;
 
-    while (p < end) {
-        wire = ngx_pb_read_varint(&p, end);
-        field_no = wire >> 3;
-        wire &= 0x07;
+    /* Pass 1: find the country code (first occurrence wins). */
+    q = p;
+    while (q < end) {
+        if (ngx_pb_read_varint(&q, end, &tag) != NGX_OK) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "geosite: truncated GeoSite entry tag");
+            return NGX_ERROR;
+        }
+        field_no = tag >> 3;
+        wire = tag & 0x07;
 
-        if (field_no == NGX_GEOSITE_FIELD_COUNTRY_CODE && wire == NGX_PB_WIRE_LEN) {
-            str_end = ngx_pb_read_len(&p, end, &len);
+        if (field_no == NGX_GEOSITE_FIELD_COUNTRY_CODE
+            && wire == NGX_PB_WIRE_LEN)
+        {
+            str_end = ngx_pb_read_len(&q, end, &len);
             if (str_end == NULL) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                    "geosite: truncated country_code length");
                 return NGX_ERROR;
             }
-            country_code.data = p;
+            country_code.data = q;
             country_code.len = len;
-            p = str_end;
-
-            /* If we have not yet allocated the category, do so now
-             * (with filter check). */
-            if (cat == NULL) {
-                if (country_code.len == 0) {
-                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                       "geosite: empty country_code");
-                    return NGX_ERROR;
-                }
-
-                matched = 1;
-                if (gmcf->filters != NULL && gmcf->filters->nelts > 0) {
-                    matched = 0;
-                    filter_tag = gmcf->filters->elts;
-                    for (i = 0; i < gmcf->filters->nelts; i++) {
-                        if (filter_tag[i].len == country_code.len &&
-                            ngx_strncasecmp(filter_tag[i].data,
-                                            country_code.data,
-                                            country_code.len) == 0)
-                        {
-                            matched = 1;
-                            break;
-                        }
-                    }
-                }
-
-                if (!matched) {
-                    *out_cat = NULL;
-                    /* we still need to skip remaining fields */
-                    continue;
-                }
-
-                cat = ngx_array_push(gmcf->categories);
-                if (cat == NULL) return NGX_ERROR;
-                ngx_memzero(cat, sizeof(ngx_stream_geosite_category_t));
-
-                cat->tag.data = ngx_pnalloc(cf->cycle->pool, country_code.len);
-                if (cat->tag.data == NULL) return NGX_ERROR;
-                ngx_strlow(cat->tag.data, country_code.data, country_code.len);
-                cat->tag.len = country_code.len;
-
-                if (ngx_array_init(&cat->plain_array, cf->cycle->pool, 32,
-                                   sizeof(ngx_str_t)) != NGX_OK)
-                {
-                    return NGX_ERROR;
-                }
-
-                full_keys = ngx_pcalloc(cf->pool, sizeof(ngx_hash_keys_arrays_t));
-                domain_keys = ngx_pcalloc(cf->pool, sizeof(ngx_hash_keys_arrays_t));
-                if (full_keys == NULL || domain_keys == NULL) return NGX_ERROR;
-
-                full_keys->pool = cf->pool;
-                full_keys->temp_pool = cf->pool;
-                domain_keys->pool = cf->pool;
-                domain_keys->temp_pool = cf->pool;
-
-                if (ngx_hash_keys_array_init(full_keys, NGX_HASH_LARGE) != NGX_OK) {
-                    return NGX_ERROR;
-                }
-                if (ngx_hash_keys_array_init(domain_keys, NGX_HASH_LARGE) != NGX_OK) {
-                    return NGX_ERROR;
-                }
-
-                /* stash via a parallel struct */
-                cat->full_hash.buckets = (ngx_hash_elt_t **) full_keys;
-                cat->domain_hash.buckets = (ngx_hash_elt_t **) domain_keys;
-            }
-            continue;
+            q = str_end;
+            break;
         }
+
+        if (ngx_pb_skip_field(&q, end, wire) != NGX_OK) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "geosite: malformed field in GeoSite entry");
+            return NGX_ERROR;
+        }
+    }
+
+    if (country_code.data == NULL || country_code.len == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "geosite: missing or empty country_code");
+        return NGX_ERROR;
+    }
+
+    /* Filter check: keep only the requested categories. */
+    matched = 1;
+    if (gmcf->filters != NULL && gmcf->filters->nelts > 0) {
+        matched = 0;
+        filter_tag = gmcf->filters->elts;
+        for (i = 0; i < gmcf->filters->nelts; i++) {
+            if (filter_tag[i].len == country_code.len &&
+                ngx_strncasecmp(filter_tag[i].data,
+                                country_code.data,
+                                country_code.len) == 0)
+            {
+                matched = 1;
+                break;
+            }
+        }
+    }
+
+    if (!matched) {
+        return NGX_OK;  /* category filtered out; skip its domains */
+    }
+
+    cat = ngx_array_push(gmcf->categories);
+    if (cat == NULL) return NGX_ERROR;
+    ngx_memzero(cat, sizeof(ngx_stream_geosite_category_t));
+
+    cat->tag.data = ngx_pnalloc(cf->cycle->pool, country_code.len);
+    if (cat->tag.data == NULL) return NGX_ERROR;
+    ngx_strlow(cat->tag.data, country_code.data, country_code.len);
+    cat->tag.len = country_code.len;
+
+    if (ngx_array_init(&cat->plain_array, cf->cycle->pool, 32,
+                       sizeof(ngx_str_t)) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    full_keys = ngx_pcalloc(cf->pool, sizeof(ngx_hash_keys_arrays_t));
+    domain_keys = ngx_pcalloc(cf->pool, sizeof(ngx_hash_keys_arrays_t));
+    if (full_keys == NULL || domain_keys == NULL) return NGX_ERROR;
+
+    full_keys->pool = cf->pool;
+    full_keys->temp_pool = cf->pool;
+    domain_keys->pool = cf->pool;
+    domain_keys->temp_pool = cf->pool;
+
+    if (ngx_hash_keys_array_init(full_keys, NGX_HASH_LARGE) != NGX_OK) {
+        return NGX_ERROR;
+    }
+    if (ngx_hash_keys_array_init(domain_keys, NGX_HASH_LARGE) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    /* stash via a parallel struct */
+    cat->full_hash.buckets = (ngx_hash_elt_t **) full_keys;
+    cat->domain_hash.buckets = (ngx_hash_elt_t **) domain_keys;
+
+    /* Pass 2: parse the Domain entries. */
+    while (p < end) {
+        if (ngx_pb_read_varint(&p, end, &tag) != NGX_OK) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "geosite: truncated GeoSite entry tag");
+            return NGX_ERROR;
+        }
+        field_no = tag >> 3;
+        wire = tag & 0x07;
 
         if (field_no == NGX_GEOSITE_FIELD_DOMAIN && wire == NGX_PB_WIRE_LEN) {
             str_end = ngx_pb_read_len(&p, end, &len);
@@ -729,22 +802,15 @@ ngx_stream_geosite_process_geosite(ngx_conf_t *cf,
                                    "geosite: truncated domain entry length");
                 return NGX_ERROR;
             }
-            dom_body = p;
-            dom_end = str_end;
-            p = str_end;
 
-            if (cat != NULL) {
-                full_keys = (ngx_hash_keys_arrays_t *) cat->full_hash.buckets;
-                domain_keys = (ngx_hash_keys_arrays_t *) cat->domain_hash.buckets;
-
-                if (ngx_stream_geosite_parse_domain(cf, dom_body, dom_end,
-                                                    cat,
-                                                    full_keys, domain_keys)
-                    != NGX_OK)
-                {
-                    return NGX_ERROR;
-                }
+            if (ngx_stream_geosite_parse_domain(cf, parse_pool,
+                                                p, str_end, cat,
+                                                full_keys, domain_keys)
+                != NGX_OK)
+            {
+                return NGX_ERROR;
             }
+            p = str_end;
             continue;
         }
 
@@ -755,7 +821,6 @@ ngx_stream_geosite_process_geosite(ngx_conf_t *cf,
         }
     }
 
-    *out_cat = cat;
     return NGX_OK;
 }
 
@@ -764,19 +829,24 @@ ngx_stream_geosite_process_geosite(ngx_conf_t *cf,
  * Top-level parser: walk the GeoSiteList.
  */
 static ngx_int_t
-ngx_stream_geosite_parse_buf(ngx_conf_t *cf, u_char *buf, u_char *end,
+ngx_stream_geosite_parse_buf(ngx_conf_t *cf, ngx_pool_t *parse_pool,
+    u_char *buf, u_char *end,
     ngx_stream_geosite_main_conf_t *gmcf)
 {
-    ngx_uint_t   field_no, wire;
+    ngx_uint_t   field_no, wire, tag;
     u_char      *p = buf;
     u_char      *body, *body_end;
     size_t       len;
-    ngx_stream_geosite_category_t  *cat;
 
     while (p < end) {
-        wire = ngx_pb_read_varint(&p, end);
-        field_no = wire >> 3;
-        wire &= 0x07;
+        if (ngx_pb_read_varint(&p, end, &tag) != NGX_OK) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "geosite: truncated top-level tag "
+                               "(file cut short?)");
+            return NGX_ERROR;
+        }
+        field_no = tag >> 3;
+        wire = tag & 0x07;
 
         if (field_no == NGX_GEOSITE_LIST_FIELD_ENTRY && wire == NGX_PB_WIRE_LEN) {
             body_end = ngx_pb_read_len(&p, end, &len);
@@ -788,8 +858,9 @@ ngx_stream_geosite_parse_buf(ngx_conf_t *cf, u_char *buf, u_char *end,
             body = p;
             p = body_end;
 
-            if (ngx_stream_geosite_process_geosite(cf, body, body_end,
-                                                   gmcf, &cat) != NGX_OK)
+            if (ngx_stream_geosite_process_geosite(cf, parse_pool,
+                                                   body, body_end, gmcf)
+                != NGX_OK)
             {
                 return NGX_ERROR;
             }
@@ -984,7 +1055,6 @@ ngx_stream_geosite_variable(ngx_stream_session_t *s,
                 v->data = cat->tag.data;
                 v->len = cat->tag.len;
                 v->valid = 1;
-                v->no_cacheable = 1;
                 v->not_found = 0;
 
                 ngx_log_error(NGX_LOG_DEBUG, s->connection->log, 0,
@@ -1013,7 +1083,6 @@ ngx_stream_geosite_variable(ngx_stream_session_t *s,
                     v->data = cat->tag.data;
                     v->len = cat->tag.len;
                     v->valid = 1;
-                    v->no_cacheable = 1;
                     v->not_found = 0;
 
                     ngx_log_error(NGX_LOG_DEBUG, s->connection->log, 0,
@@ -1038,7 +1107,6 @@ ngx_stream_geosite_variable(ngx_stream_session_t *s,
                     v->data = cat->tag.data;
                     v->len = cat->tag.len;
                     v->valid = 1;
-                    v->no_cacheable = 1;
                     v->not_found = 0;
 
                     ngx_log_error(NGX_LOG_DEBUG, s->connection->log, 0,
@@ -1082,9 +1150,15 @@ ngx_stream_geosite_init(ngx_conf_t *cf)
         }
     }
 
-    /* Register $geosite_category */
-    v = ngx_stream_add_variable(cf, &geosite_category_name,
-                                NGX_STREAM_VAR_NOCACHEABLE);
+    /*
+     * Register $geosite_category as cacheable: the SNI it derives from
+     * is fixed once ssl_preread completes and the category tables are
+     * fixed at config time, so the result is stable for the whole
+     * session.  Caching avoids re-running the full category scan (and
+     * a fresh pool allocation) for every map / proxy_interface / log
+     * reference — previously 2-4 evaluations per session.
+     */
+    v = ngx_stream_add_variable(cf, &geosite_category_name, 0);
     if (v == NULL) {
         return NGX_ERROR;
     }
