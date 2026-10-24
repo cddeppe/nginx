@@ -157,6 +157,16 @@ stream {
 }
 ```
 
+### Match precedence
+
+When an SNI matches more than one loaded category (e.g. a domain listed
+under both `google` and `google-ads`), the **file order** of the
+categories inside `geosite.dat` decides which tag `$geosite_category`
+returns — the order of names in `geosite_filter` is only a load filter
+and does not define precedence. If a domain is in two categories you
+load, either keep only the one you want routed, or account for the
+file's ordering when writing your `map`.
+
 ### Verifying it works
 
 ```bash
