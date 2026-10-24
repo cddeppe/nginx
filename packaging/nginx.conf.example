@@ -85,23 +85,21 @@ stream {
 
     # -------------------------------------------------------------------
     # 3. Geosite → egress interface (Xray outboundTag equivalent)
+    #    Multiple keys may share one value in a single entry.
     # -------------------------------------------------------------------
     map $geosite_category $geosite_iface {
-        default  off;
-        amazon   ak;     # wg-quick interface name
-        hulu     ak;
-        disney   ak;
-        netflix  ak;
+        default                    off;
+        amazon hulu disney netflix ak;     # wg-quick interface name
     }
 
     # -------------------------------------------------------------------
     # 4. Bare-domain overrides (Xray "domain:" rules)
+    #    Regex keys can be combined the same way.
     # -------------------------------------------------------------------
     map $ssl_preread_server_name $domain_override {
-        default                       $geosite_iface;
-        ~*^(.+\.)?intuit\.com$        ak;
-        ~*^(.+\.)?intuitcdn\.net$     ak;
-        ~*^dns\.controld\.com$        off;   # direct, must NOT go through WG
+        default                                            $geosite_iface;
+        ~*^(.+\.)?intuit\.com$ ~*^(.+\.)?intuitcdn\.net$  ak;
+        ~*^dns\.controld\.com$                             off;   # direct
     }
 
     # -------------------------------------------------------------------
@@ -113,7 +111,26 @@ stream {
     }
 
     # -------------------------------------------------------------------
-    # 6. Main TLS-passthrough proxy (edit IPs to match your server)
+    # 6. Shared server defaults — set once at stream{} level, inherited
+    #    by every server{} below (no need to repeat them per server).
+    # -------------------------------------------------------------------
+    tcp_nodelay             on;
+    preread_buffer_size     16k;
+    preread_timeout         30s;
+    proxy_timeout           4h;
+    proxy_connect_timeout   30s;
+    proxy_buffer_size       2048k;
+    proxy_socket_keepalive  on;
+    proxy_ssl_session_reuse off;
+
+    # default resolver for all servers (a server may override)
+    resolver 127.0.0.1 [::1] ipv4=on ipv6=on valid=30s;
+
+    # -------------------------------------------------------------------
+    # 7. Main TLS-passthrough proxy (edit IPs to match your server)
+    #    Only the per-server specifics live here: listen address list,
+    #    ssl_preread, proxy_pass — the shared settings are inherited
+    #    from the stream{} block above.
     # -------------------------------------------------------------------
     server {
         # Multiple specific addresses in one directive (one socket each,
@@ -122,19 +139,7 @@ stream {
         listen 0.0.0.0:443 bind reuseport so_keepalive=on fastopen=256;
         listen [::]:443 bind reuseport so_keepalive=on fastopen=256;
 
-        resolver 127.0.0.1 [::1] ipv4=on ipv6=on valid=30s;
-
-        preread_buffer_size 16k;
-        preread_timeout 30s;
-
         ssl_preread on;
-        tcp_nodelay on;
-
-        proxy_timeout 4h;
-        proxy_connect_timeout 30s;
-        proxy_buffer_size 2048k;
-        proxy_socket_keepalive on;
-        proxy_ssl_session_reuse off;
 
         # Bind upstream socket to chosen interface via SO_BINDTODEVICE.
         # Empty / "off" → no bind (use main routing table).
@@ -144,11 +149,18 @@ stream {
     }
 
     # -------------------------------------------------------------------
-    # 7. Example NAS backends (uncomment + edit to match your setup)
+    # 8. Example NAS port forwards (uncomment + edit to match your setup)
+    #    A variable default passes unknown ports through unchanged, so
+    #    only the remapped ports need explicit entries.
     # -------------------------------------------------------------------
+    # map $server_port $nas_backend {
+    #     default   "nas.example.com:$server_port";
+    #     3390      "nas.example.com:3389";
+    #     32410     "nas.example.com:32400";
+    # }
+    #
     # server {
-    #     listen 82.21.4.42:3064, [2a0e:7d43:0:1::1]:3064 bind reuseport so_keepalive=off fastopen=256;
-    #     resolver 127.0.0.1 [::1] ipv4=on ipv6=off valid=1s;
-    #     proxy_pass nas.deppe.cc:3064;
+    #     listen 82.21.4.42:3064, 82.21.4.42:3066, [2a0e:7d43:0:1::1]:3064 bind reuseport so_keepalive=off fastopen=256;
+    #     proxy_pass $nas_backend;    # resolver inherited from stream{}
     # }
 }
