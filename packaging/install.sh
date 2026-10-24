@@ -42,6 +42,32 @@ warn() { echo -e "\033[1;33mWARN:\033[0m $*" >&2; }
 err()  { echo -e "\033[1;31mERROR:\033[0m $*" >&2; }
 die()  { err "$*"; exit 1; }
 
+# Help text lives in a function (not grepped out of "$0") so it works
+# under `curl ... | sudo bash`, where $0 is "bash" and the old
+# `grep ... "$0"` aborted the script via set -e before reaching exit 0.
+show_help() {
+    cat <<'EOF'
+Usage (as root or via sudo):
+  curl -fsSL https://raw.githubusercontent.com/cddeppe/nginx/master/packaging/install.sh | sudo bash
+
+  Or with options:
+  curl -fsSL https://raw.githubusercontent.com/cddeppe/nginx/master/packaging/install.sh | sudo bash -s -- --start
+
+What it does:
+  1. Detects architecture (amd64 or arm64)
+  2. Fetches the latest release .deb from GitHub
+  3. Installs it (replaces stock nginx if present), resolves deps
+  4. Downloads geosite dlc.dat to /usr/local/etc/xray/domains/
+  5. Sets up weekly cron auto-refresh of dlc.dat
+  6. Enables and starts nginx when the config is valid
+
+Flags:
+  --start       Legacy; nginx is now started automatically when the config is valid
+  --uninstall   Remove nginx-geosite cleanly
+  --help        Show this help
+EOF
+}
+
 require_root() {
     if [[ $EUID -ne 0 ]]; then
         die "This script must be run as root (use sudo)."
@@ -79,22 +105,23 @@ Dpkg::Options {
 APT::Get::Assume-Yes "true";
 CONF
 
-    # Disable needrestart during install — it tries to restart services
-    # after apt-get install, and can stop nginx without restarting it
-    # (race condition with our own service management). We handle nginx
-    # restart ourselves; needrestart just gets in the way.
-    cat > /etc/apt/apt.conf.d/99nginx-geosite-needrestart <<'CONF'
-NeedRestart::Services "\$nrconf{needrestart} = 'n';";
-NeedRestart::Verbosity 0;
-CONF
-
-    # Also set environment variable for needrestart (belt and suspenders)
+    # Suppress needrestart during the install — it tries to restart
+    # services after apt-get install and can stop nginx without
+    # restarting it (a race with our own service management).  The
+    # supported mechanism is the environment: needrestart reads
+    # NEEDRESTART_MODE (n = do nothing) and NEEDRESTART_SUSPEND, and its
+    # apt hook (DPkg::Post-Invoke) inherits this script's environment.
+    # (An earlier version wrote a NeedRestart::Services apt.conf snippet
+    # here — no such option exists, apt ignored the file, and the quoted
+    # heredoc left a literal "\$nrconf" in it anyway.)
     export NEEDRESTART_SUSPEND=1
     export NEEDRESTART_MODE=n
 }
 
 force_confold_cleanup() {
     rm -f /etc/apt/apt.conf.d/99nginx-geosite-install
+    # Leftover from older versions of this script (the snippet never
+    # worked — see force_confold_setup); clean it up if present.
     rm -f /etc/apt/apt.conf.d/99nginx-geosite-needrestart
 }
 
@@ -159,7 +186,14 @@ download_latest_deb() {
         latest_tag="$(curl -fsSL "https://github.com/$GITHUB_REPO/releases/latest" \
                        -o /dev/null -w '%{url_effective}' | \
                        sed 's|.*/tag/||; s|%2B|+|g' || true)"
-        if [[ -z "$latest_tag" || "$latest_tag" == "https://github.com/$GITHUB_REPO/releases" ]]; then
+        # Validate the tag shape.  On scrape failure curl still prints
+        # %{url_effective} — the un-redirected .../releases/latest URL —
+        # and the old guard only compared against a plain "/releases"
+        # prefix, so a full URL slipped through and produced a garbage
+        # download URL.  Anything that is not ^v<digit> is rejected.
+        # NB: a raw '+' in the URL path is served fine by GitHub (it 302s
+        # to the CDN asset), verified against this repo's own releases.
+        if [[ ! "$latest_tag" =~ ^v[0-9] ]]; then
             die "Could not determine latest release tag. Check https://github.com/$GITHUB_REPO/releases"
         fi
         log "Latest tag (via HTML): $latest_tag"
@@ -372,7 +406,7 @@ main() {
             --start)      do_start=1 ;;
             --uninstall)  do_uninstall=1 ;;
             --help|-h)
-                grep -E '^# (Usage|What it does|Flags)' "$0" -A 10 | sed 's/^# //; s/^#//'
+                show_help
                 exit 0
                 ;;
             *) die "Unknown option: $1 (try --help)" ;;
