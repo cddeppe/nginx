@@ -399,27 +399,35 @@ static ngx_int_t
 rg_build_client_hello(rg_probe_t *probe)
 {
     /*
-     * Minimal TLS 1.2 ClientHello with a server_name extension:
+     * Minimal TLS 1.2 ClientHello with server_name + signature_algorithms:
      *
-     *   16 03 01 LL LL            TLS record (handshake)
-     *   01 00 00 LL               ClientHello
-     *   03 03                      client_version TLS 1.2
+     *   16 03 01 LL LL               TLS record (handshake)
+     *   01 00 00 LL                  ClientHello
+     *   03 03                        client_version TLS 1.2
      *   <32 random>
-     *   00                         session_id length
-     *   00 02 00 2f                one cipher: TLS_RSA_WITH_AES_128_CBC_SHA
-     *   01 00                      compression: null
-     *   LL LL                      extensions length
-     *   00 00 LL LL                server_name ext header
-     *   00 LL 00 LL <sni>          server_name list
+     *   00                           session_id length
+     *   00 04 c0 2f c0 2b            ciphers: ECDHE-(RSA|ECDSA)-AES128-GCM
+     *   01 00                        compression: null
+     *   LL LL                        extensions length
+     *   00 00 LL LL LL LL 00 LL LL <sni>        server_name extension
+     *   00 0d 00 06 00 02 04 03 04 01           signature_algorithms
+     *
+     * The server_name encoding is byte-exact per RFC 6066: a conformant
+     * parser (nginx ssl_preread included) must extract probe->sni from
+     * it.  The ciphers are ECDHE-GCM so modern origins answer with a
+     * ServerHello rather than a handshake alert (RSA key exchange is
+     * refused by most CDNs today).
      */
     u_char    *p = probe->ch;
     size_t     sni_len = probe->sni.len;
-    size_t     sni_ext_len, body_len, total;
+    size_t     sni_body, sig_body, exts_len, body_len, total;
     u_char    *ext_len_p, *body_len_p, *rec_len_p;
     ngx_uint_t i;
 
-    sni_ext_len = 9 + sni_len;                    /* ext hdr + list + sni */
-    body_len = 2 + 32 + 1 + 4 + 2 + 2 + sni_ext_len;
+    sni_body = 5 + sni_len;            /* list_len + type + name_len + name */
+    sig_body = 6;                      /* count + 2 signature algorithms */
+    exts_len = (4 + sni_body) + (4 + sig_body);
+    body_len = 2 + 32 + 1 + 2 + 4 + 2 + 2 + exts_len;
     total = 5 + 4 + body_len;
 
     if (total > sizeof(probe->ch)) {
@@ -442,15 +450,18 @@ rg_build_client_hello(rg_probe_t *probe)
     *p++ = 0x03; *p++ = 0x03;
     for (i = 0; i < 32; i++) *p++ = rnd[i];
     *p++ = 0x00;                                  /* session id */
-    *p++ = 0x00; *p++ = 0x02; *p++ = 0x00; *p++ = 0x2f;
+    *p++ = 0x00; *p++ = 0x04;
+    *p++ = 0xc0; *p++ = 0x2f;         /* ECDHE-RSA-AES128-GCM-SHA256 */
+    *p++ = 0xc0; *p++ = 0x2b;         /* ECDHE-ECDSA-AES128-GCM-SHA256 */
     *p++ = 0x01; *p++ = 0x00;                     /* compression */
     ext_len_p = p; p += 2;                        /* extensions length */
 
-    /* server_name extension */
+    /* server_name extension (RFC 6066):
+     *   uint16 ext_body_len; uint16 list_len; uint8 type; uint16 name_len;
+     *   name */
     *p++ = 0x00; *p++ = 0x00;
-    *p++ = (u_char) ((sni_ext_len - 4) >> 8);
-    *p++ = (u_char) ((sni_ext_len - 4) & 0xff);
-    *p++ = 0x00;
+    *p++ = (u_char) (sni_body >> 8);
+    *p++ = (u_char) (sni_body & 0xff);
     *p++ = (u_char) ((sni_len + 3) >> 8);
     *p++ = (u_char) ((sni_len + 3) & 0xff);
     *p++ = 0x00;
@@ -458,14 +469,21 @@ rg_build_client_hello(rg_probe_t *probe)
     *p++ = (u_char) (sni_len & 0xff);
     for (i = 0; i < sni_len; i++) *p++ = probe->sni.data[i];
 
+    /* signature_algorithms extension (needed for TLS 1.2 ECDHE) */
+    *p++ = 0x00; *p++ = 0x0d;
+    *p++ = 0x00; *p++ = 0x06;
+    *p++ = 0x00; *p++ = 0x02;
+    *p++ = 0x04; *p++ = 0x03;         /* ecdsa_secp256r1_sha256 */
+    *p++ = 0x04; *p++ = 0x01;         /* rsa_pkcs1_sha256 */
+
     /* fill lengths */
     body_len = (size_t) (p - body_len_p - 3);
     body_len_p[0] = (u_char) (body_len >> 16);
     body_len_p[1] = (u_char) (body_len >> 8);
     body_len_p[2] = (u_char) (body_len & 0xff);
 
-    ext_len_p[0] = (u_char) (sni_ext_len >> 8);
-    ext_len_p[1] = (u_char) (sni_ext_len & 0xff);
+    ext_len_p[0] = (u_char) (exts_len >> 8);
+    ext_len_p[1] = (u_char) (exts_len & 0xff);
 
     total = (size_t) (p - rec_len_p - 2);
     rec_len_p[0] = (u_char) (total >> 8);
@@ -1605,7 +1623,8 @@ rg_evaluate_group(rg_group_t *g)
     rg_member_shm_t *sm;
     ngx_uint_t       n, i, fails_pct, ok_cnt, n_seen;
     ngx_uint_t       bad[NGX_RG_MAX_MEMBERS];
-    ngx_uint_t       all_bad = 1;
+    ngx_uint_t       cand = 0, cand_bad = 0;
+    ngx_uint_t       shared_now;
     ngx_msec_t       now = ngx_current_msec;
 
     if (g->shm == NULL) {
@@ -1633,18 +1652,32 @@ rg_evaluate_group(rg_group_t *g)
                      && sm->rtt_ewma * 100
                         > sm->rtt_baseline * g->rtt_ratio_x100);
 
-        if (!bad[i]) {
-            all_bad = 0;
+        if (sm->state != NGX_RG_STATE_DOWN) {
+            cand++;
+            if (bad[i]) {
+                cand_bad++;
+            }
         }
     }
 
-    if (n > 1 && all_bad) {
+    /*
+     * Shared fate means all LIVE members are bad at once (or every
+     * member is hard-DOWN).  Members already DOWN do not count toward
+     * it: with one path dead and the survivor merely flaky, the
+     * flakiness is that member's own signal, not a local-uplink
+     * problem - and re-announcing "shared fate" on every flappy eval
+     * spams the log and misleads.
+     */
+    shared_now = (n > 1 && (cand >= 2 || cand == 0) && cand == cand_bad);
+
+    if (shared_now) {
         if (!sh->shared_fate) {
             sh->shared_fate = 1;
             ngx_log_error(NGX_LOG_NOTICE, ngx_cycle->log, 0,
-                          "route_group \"%V\": all members bad - shared fate "
-                          "suspected (local uplink?); DEGRADED transitions "
-                          "suppressed, DOWN (hard failures) still allowed",
+                          "route_group \"%V\": all live members bad - shared "
+                          "fate suspected (local uplink?); DEGRADED "
+                          "transitions suppressed, DOWN (hard failures) "
+                          "still allowed",
                           &g->name);
         }
         /* fall through: DOWN transitions must still be possible when every
@@ -1673,7 +1706,7 @@ rg_evaluate_group(rg_group_t *g)
                 new_state = NGX_RG_STATE_DOWN;
 
             } else if (sm->bad_streak >= g->sustain
-                       && sm->state == NGX_RG_STATE_UP && !all_bad)
+                       && sm->state == NGX_RG_STATE_UP && !sh->shared_fate)
             {
                 /* metric-breach DEGRADATION is suppressed while every member
                  * is bad (common cause); hard failures still go DOWN above */
