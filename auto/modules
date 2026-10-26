@@ -1346,20 +1346,6 @@ if [ $STREAM != NO ]; then
 
         . auto/module
     fi
-
-    # ngx_stream_route_group_module - transport failover groups.
-    # route_group/path_probe blocks; health-based member selection when a
-    # variable proxy_pass target evaluates to a group name; active probes
-    # (tcp/tls), per-group shm state, leader-elected probe runner.
-    if [ $STREAM = YES ]; then
-        ngx_module_name=ngx_stream_route_group_module
-        ngx_module_deps=
-        ngx_module_srcs=src/stream/ngx_stream_route_group_module.c
-        ngx_module_libs=
-        ngx_module_link=YES
-
-        . auto/module
-    fi
 fi
 
 
