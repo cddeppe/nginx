@@ -33,8 +33,11 @@ stream {
 
     # failover group -------------------------------------------------------
     route_group al_transport {
-        server 127.0.0.1:11443 priority=1 probe=direct_probe;  # direct
-        server 127.0.0.1:12443 priority=2 probe=tunnel_probe;  # tunnel
+        # direct is ~37ms healthy; demote it above 65ms no matter what the
+        # learned baseline thinks (see "Absolute RTT ceiling" below)
+        server 127.0.0.1:11443 priority=1 probe=direct_probe
+            degrade_rtt_max=65ms;                                       # direct
+        server 127.0.0.1:12443 priority=2 probe=tunnel_probe;           # tunnel
 
         degrade_rtt_ratio  1.8;
         degrade_fail_pct   20;
@@ -87,12 +90,19 @@ egresses (far-end resolves the probe name literally).
 
 | directive | meaning | default |
 |---|---|---|
-| `server <addr:port> priority=N probe=<name>` | member; lower priority wins | required |
+| `server <addr:port> priority=N probe=<name> [degrade_rtt_max=<t>]` | member; lower priority wins | required |
 | `degrade_rtt_ratio <r>` | EWMA/baseline ratio that counts as degraded | `1.8` |
 | `degrade_fail_pct <p>` | failed-probe % over the last 32 probes | `20` |
 | `down_fail_streak <n>` | consecutive probe failures → DOWN | `3` |
 | `sustain <n>` | consecutive bad evals before leaving UP | `3` |
 | `failback <t>` | continuous health required to return to UP | `120s` |
+
+`degrade_rtt_max` is a per-member **absolute RTT ceiling**: when the
+member's EWMA rises above it, the member is degraded — independent of the
+learned baseline. Set it to roughly `degrade_rtt_ratio` × the path's known
+healthy RTT. Heterogeneous members need different ceilings (a direct
+DE→AL hop is ~37 ms healthy, a CF tunnel rides at 100–200 ms), which is
+why this lives on the `server` line. Default `0` disables the check.
 
 ## State machine
 
@@ -100,13 +110,24 @@ Each member is `UP`, `DEGRADED` or `DOWN`.
 
 - **UP → DEGRADED**: RTT EWMA exceeds `degrade_rtt_ratio` × its own
   baseline (learned from its healthy history; EWMA rises fast at 1/8,
-  decays slow at 1/3), or the rolling failure percentage exceeds
-  `degrade_fail_pct`. Needs `sustain` consecutive bad evaluations.
+  decays slow at 1/3), the rolling failure percentage exceeds
+  `degrade_fail_pct`, or the EWMA exceeds the member's `degrade_rtt_max`
+  ceiling. Needs `sustain` consecutive bad evaluations.
 - **anything → DOWN**: `down_fail_streak` consecutive probe timeouts.
   DOWN always fires, even under shared-fate suppression (below).
 - **DEGRADED/DOWN → UP**: only after `failback` of continuously healthy
   probes. Recovery from a failure streak resets the failure window on
   the *first* success, so dilution lag does not delay healing.
+
+**Absolute RTT ceiling — why `degrade_rtt_max` exists.** The learned
+baseline seeds from the *first* successful probe and afterwards only
+tracks new minima (upward drift is 1/3600 per probe). Restart the daemon
+while the path is *already* degraded — the classic case is an evening
+peak that starts before the box reboots — and the baseline seeds at the
+degraded RTT: the ratio reads ~1.0 and the member never demotes. Failover
+goes blind exactly when it is needed. The absolute ceiling is immune to
+that seeding problem. Prefer setting it on every member whose healthy
+RTT you know.
 
 **Selection** (never blackholes): first member that is UP by priority;
 if none, first DEGRADED; if none, member 0. Traffic always has an
@@ -141,12 +162,24 @@ own — that keeps semantics simple and avoids mid-stream address swaps.
 | `$route_member_rtt` | member RTT EWMA, milliseconds |
 
 State transitions are logged at `notice` level, prefixed
-`route_group`, including the numbers that caused them:
+`route_group`, including the numbers that caused them — and, when the
+latest probe failed, **why** it failed:
 
 ```
 route_group "al_transport": member 0 (127.0.0.1:11443) state up -> degraded
     (ewma=61.5ms baseline=29.8ms fail_streak=0)
+route_group "al_transport": member 1 (127.0.0.1:12443) state up -> down
+    (ewma=0ms baseline=0ms fail_streak=3 last_fail=peer closed, no data)
 ```
+
+`last_fail` reasons: `connect refused/unreachable`, `connect timeout`,
+`send error`, `no response in timeout`, `peer closed, no data` (listener
+accepted then hung up — a dead or SNI-rejecting far end), `reset`. The
+difference between them is the first question of any field diagnosis:
+"refused" means nothing is listening; "peer closed, no data" means the
+path is alive but the far end refused the exchange (the empty-SNI probe
+bug produced exactly this); "no response in timeout" means black-hole
+loss.
 
 Watch them with:
 
@@ -154,13 +187,23 @@ Watch them with:
 tail -f /var/log/nginx/error.log | grep route_group
 ```
 
-## Reloads
+## Reloads and restarts
 
 Group state lives in a per-group shared-memory zone: a config reload
 keeps member states, EWMA and baselines. Probe duty is held by one
 elected worker (pid + 1 s heartbeat); on reload or crash the leader
 role is taken over within a second, and draining old workers do not
 keep it.
+
+**A reload does not load a new binary.** `nginx -s reload` (or
+`systemctl reload nginx`) only re-reads the config inside the *running*
+master process. After installing a new package you must **restart**
+(`systemctl restart nginx`) for the new code to take effect — the
+packaged `install.sh` does this automatically. Symptom of getting this
+wrong: a probe fix is "installed" but nothing changes, and a member
+stays DOWN forever. A full restart also resets the shared state (members
+start UP, baselines re-seed at the current RTT — which is exactly why
+`degrade_rtt_max` matters).
 
 ## Build
 
@@ -175,6 +218,7 @@ extra flag, no external dependency.
 - **Weighted traffic splitting** between healthy members.
 
 Tuning advice: before changing thresholds, read a few real transitions
-from the error log (they print ewma/baseline/fail_streak) and set
-`degrade_rtt_ratio` / `degrade_fail_pct` / `sustain` from the numbers
+from the error log (they print ewma/baseline/fail_streak, and
+last_fail when probes fail) and set `degrade_rtt_ratio` /
+`degrade_rtt_max` / `degrade_fail_pct` / `sustain` from the numbers
 you actually see.

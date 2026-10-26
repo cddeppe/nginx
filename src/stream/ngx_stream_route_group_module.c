@@ -25,8 +25,8 @@
  *   }
  *
  *   route_group <name> {
- *       server 127.0.0.1:11443 priority=1 probe=<path_probe name>;
- *       server 127.0.0.1:12443 priority=2 probe=<path_probe name>;
+ *       server 127.0.0.1:11443 priority=1 probe=<probe> degrade_rtt_max=65ms;
+ *       server 127.0.0.1:12443 priority=2 probe=<probe>;
  *       degrade_rtt_ratio  1.8;   # ewma/baseline ratio -> DEGRADED
  *       degrade_fail_pct   20;    # probe failure % (last 32) -> DEGRADED
  *       down_fail_streak   3;     # consecutive probe failures -> DOWN
@@ -43,13 +43,29 @@
  *
  * State machine (evaluated by the leader after every probe):
  *
- *   UP        -toolgit ok, metrics within thresholds
+ *   UP        - probes ok, metrics within thresholds
  *   DEGRADED  - sustained (sustain) ratio/loss breach, not total outage
  *   DOWN      - down_fail_streak consecutive probe failures
  *
  *   UP -> DEGRADED : bad_streak >= sustain
  *   any -> DOWN    : fail_streak >= down_fail_streak
  *   !UP -> UP      : healthy (no bad eval) for >= failback
+ *
+ *   A "bad" evaluation is any of: last probe failed, failure percentage
+ *   above degrade_fail_pct, ewma above degrade_rtt_ratio x learned
+ *   baseline, or ewma above the member's optional degrade_rtt_max
+ *   (absolute ceiling).
+ *
+ * Why degrade_rtt_max exists: the learned baseline seeds from the FIRST
+ * successful probe and afterwards only tracks new minima (upward drift
+ * is 1/3600 per probe).  When (re)started while the path is ALREADY
+ * degraded - e.g. an evening peak - the baseline seeds at the degraded
+ * RTT, the ratio reads ~1.0 and the member never demotes: failover goes
+ * blind exactly when it is needed.  A per-member absolute ceiling
+ * ("this path is degraded above N ms") is immune to that seeding
+ * problem.  Heterogeneous members need their own ceilings - direct
+ * DE->AL is ~37ms healthy while a CF tunnel rides at 100-200ms - so
+ * this is a server-line parameter, not a group directive.
  *
  * Shared-fate suppression: when every member of a group is bad in the
  * same evaluation, transitions are suppressed (likely the local uplink,
@@ -60,6 +76,12 @@
  *   $route_member_addr  - chosen member addr:port (raw target when pinned)
  *   $route_member_state - member state at decision time (up|degraded|down|-)
  *   $route_member_rtt   - chosen member's last probe RTT in microseconds
+ *
+ * DOWN/degraded transition lines carry ewma/baseline/fail_streak and,
+ * when the latest probe failed, a last_fail= reason (connect refused /
+ * connect timeout / send error / no response in timeout / peer closed,
+ * no data / reset) - the difference between "dead listener" and "far
+ * end closed on us" is the first question of any field diagnosis.
  *
  * (The group name a map produced is already visible through the user's own
  *  map variable; these four describe the *decision*, deliberately under a
@@ -83,7 +105,7 @@
 #include <ngx_event_connect.h>
 
 
-#define NGX_RG_MAGIC            0x52475a4d  /* "RGZM" */
+#define NGX_RG_MAGIC            0x52475a4e  /* "RGZN" v2 layout (+last_fail) */
 #define NGX_RG_HIST_LEN         32
 #define NGX_RG_MAX_MEMBERS      16
 #define NGX_RG_LEADER_STALE     1000        /* ms without beat -> takeover */
@@ -96,6 +118,16 @@
 
 #define NGX_RG_MODE_TCP         0
 #define NGX_RG_MODE_TLS         1
+
+/* probe failure reasons (shm: rg_member_shm_t.last_fail) */
+#define RG_FAIL_NONE             0
+#define RG_FAIL_CONNECT          1
+#define RG_FAIL_CONNECT_TIMEOUT  2
+#define RG_FAIL_SEND             3
+#define RG_FAIL_TIMEOUT          4
+#define RG_FAIL_EOF              5
+#define RG_FAIL_RESET            6
+#define RG_FAIL_INTERNAL         7
 
 
 /* ------------------------------------------------------------------ */
@@ -123,6 +155,7 @@ typedef struct {
     ngx_uint_t         orig_index;
     ngx_uint_t         shm_index;     /* index after priority sort */
     rg_probe_t        *probe;         /* NULL = never probed, always UP */
+    ngx_msec_t         rtt_max_usec;  /* optional absolute ewma ceiling */
 } rg_member_t;
 
 
@@ -170,6 +203,7 @@ typedef struct {
     ngx_atomic_t       good_since;    /* msec start of healthy streak, 0 = none */
     ngx_atomic_t       last_change;   /* msec of last state change */
     ngx_atomic_t       probes_done;
+    ngx_atomic_t       last_fail;     /* RG_FAIL_* of the latest probe */
 } rg_member_shm_t;
 
 
@@ -200,6 +234,7 @@ typedef struct {
     ngx_msec_t         t0;            /* current probe start */
     ngx_uint_t         active;
     ngx_uint_t         sent;          /* ClientHello bytes sent */
+    ngx_uint_t         connected;    /* connect() phase completed */
 } rg_probe_rt_t;
 
 
@@ -236,7 +271,7 @@ static void rg_probe_connected(ngx_event_t *wev);
 static void rg_probe_send(ngx_event_t *wev);
 static void rg_probe_readable(ngx_event_t *rev);
 static void rg_probe_finish(rg_probe_rt_t *rt, ngx_uint_t ok,
-    ngx_msec_t rtt_usec);
+    ngx_msec_t rtt_usec, ngx_uint_t reason);
 static void rg_evaluate_group(rg_group_t *g);
 
 /* this fork's ngx_event_connect_peer() calls pc->get() unconditionally */
@@ -329,6 +364,22 @@ rg_state_name(ngx_uint_t state)
     case NGX_RG_STATE_DEGRADED: return (u_char *) "degraded";
     case NGX_RG_STATE_DOWN:     return (u_char *) "down";
     default:                    return (u_char *) "?";
+    }
+}
+
+
+static u_char *
+rg_fail_name(ngx_uint_t f)
+{
+    switch (f) {
+    case RG_FAIL_CONNECT:         return (u_char *) "connect refused/unreachable";
+    case RG_FAIL_CONNECT_TIMEOUT: return (u_char *) "connect timeout";
+    case RG_FAIL_SEND:            return (u_char *) "send error";
+    case RG_FAIL_TIMEOUT:         return (u_char *) "no response in timeout";
+    case RG_FAIL_EOF:             return (u_char *) "peer closed, no data";
+    case RG_FAIL_RESET:           return (u_char *) "reset";
+    case RG_FAIL_INTERNAL:        return (u_char *) "internal";
+    default:                      return (u_char *) "none";
     }
 }
 
@@ -888,7 +939,7 @@ ngx_stream_route_group_line(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
         }
         member->addr_text.len = value[1].len;
 
-        /* optional parameters: priority=N probe=name */
+        /* optional parameters: priority=N probe=name degrade_rtt_max=<time> */
         for (i = 2; i < nelts; i++) {
             if (value[i].len > 9
                 && ngx_strncmp(value[i].data, "priority=", 9) == 0)
@@ -913,6 +964,27 @@ ngx_stream_route_group_line(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
                 }
                 ngx_memcpy(member->name.data, value[i].data + 6,
                            member->name.len);
+
+            } else if (value[i].len > 16
+                       && ngx_strncmp(value[i].data, "degrade_rtt_max=", 16)
+                          == 0)
+            {
+                /* absolute ewma ceiling: "this path is degraded above N".
+                 * Needed because the learned baseline seeds at the first
+                 * probe - a (re)start mid-degradation seeds it HIGH and the
+                 * ratio check goes blind for hours; the ceiling is immune.
+                 * Per-member: direct vs tunnel paths have different
+                 * healthy RTTs.  "0" (default) disables the check. */
+                p = &value[i];
+                p->data += 16;
+                p->len -= 16;
+
+                t = ngx_parse_time(p, 0);
+                if (t == NGX_ERROR || t < 0) {
+                    goto invalid;
+                }
+
+                member->rtt_max_usec = (ngx_msec_t) t * 1000;
 
             } else {
                 goto invalid;
@@ -1357,6 +1429,7 @@ rg_probe_start(rg_probe_rt_t *rt)
 
     rt->active = 1;
     rt->sent = 0;
+    rt->connected = 0;
     rt->t0 = ngx_current_msec;
 
     pc = &rt->pc;
@@ -1373,13 +1446,13 @@ rg_probe_start(rg_probe_rt_t *rt)
     rc = ngx_event_connect_peer(pc);
 
     if (rc == NGX_ERROR || rc == NGX_BUSY) {
-        rg_probe_finish(rt, 0, 0);
+        rg_probe_finish(rt, 0, 0, RG_FAIL_INTERNAL);
         return;
     }
 
     if (rc == NGX_DECLINED) {
         /* connect() failed synchronously (refused / unreachable) */
-        rg_probe_finish(rt, 0, 0);
+        rg_probe_finish(rt, 0, 0, RG_FAIL_CONNECT);
         return;
     }
 
@@ -1412,7 +1485,7 @@ rg_probe_connected(ngx_event_t *wev)
     ngx_msec_int_t     remaining;
 
     if (wev->timedout) {
-        rg_probe_finish(rt, 0, 0);
+        rg_probe_finish(rt, 0, 0, RG_FAIL_CONNECT_TIMEOUT);
         return;
     }
 
@@ -1422,13 +1495,15 @@ rg_probe_connected(ngx_event_t *wev)
         err = ngx_socket_errno;
     }
     if (err) {
-        rg_probe_finish(rt, 0, 0);
+        rg_probe_finish(rt, 0, 0, RG_FAIL_CONNECT);
         return;
     }
 
+    rt->connected = 1;
+
     if (p->mode == NGX_RG_MODE_TCP) {
         rg_probe_finish(rt, 1,
-                        (ngx_current_msec - rt->t0) * 1000);
+                        (ngx_current_msec - rt->t0) * 1000, RG_FAIL_NONE);
         return;
     }
 
@@ -1441,14 +1516,14 @@ rg_probe_connected(ngx_event_t *wev)
 
     if (rt->sent < p->ch_len) {
         if (n == -1 && ngx_socket_errno != NGX_EAGAIN) {
-            rg_probe_finish(rt, 0, 0);
+            rg_probe_finish(rt, 0, 0, RG_FAIL_SEND);
             return;
         }
         wev->handler = rg_probe_send;
         remaining = (ngx_msec_int_t)
                     (p->timeout - (ngx_current_msec - rt->t0));
         if (remaining <= 0) {
-            rg_probe_finish(rt, 0, 0);
+            rg_probe_finish(rt, 0, 0, RG_FAIL_TIMEOUT);
             return;
         }
         ngx_add_timer(c->read, (ngx_msec_t) remaining);
@@ -1458,7 +1533,7 @@ rg_probe_connected(ngx_event_t *wev)
     /* fully sent: wait for the first response byte */
     remaining = (ngx_msec_int_t) (p->timeout - (ngx_current_msec - rt->t0));
     if (remaining <= 0) {
-        rg_probe_finish(rt, 0, 0);
+        rg_probe_finish(rt, 0, 0, RG_FAIL_TIMEOUT);
         return;
     }
     ngx_add_timer(c->read, (ngx_msec_t) remaining);
@@ -1485,7 +1560,7 @@ rg_probe_send(ngx_event_t *wev)
     }
 
     if (n == -1 && ngx_socket_errno != NGX_EAGAIN) {
-        rg_probe_finish(rt, 0, 0);
+        rg_probe_finish(rt, 0, 0, RG_FAIL_SEND);
     }
 }
 
@@ -1499,20 +1574,24 @@ rg_probe_readable(ngx_event_t *rev)
     ssize_t             n;
 
     if (rev->timedout) {
-        rg_probe_finish(rt, 0, 0);
+        rg_probe_finish(rt, 0, 0, RG_FAIL_TIMEOUT);
         return;
     }
 
     n = recv(c->fd, buf, sizeof(buf), 0);
 
     if (n > 0) {
-        rg_probe_finish(rt, 1, (ngx_current_msec - rt->t0) * 1000);
+        rg_probe_finish(rt, 1, (ngx_current_msec - rt->t0) * 1000,
+                        RG_FAIL_NONE);
         return;
     }
 
     if (n == 0) {
-        /* EOF before any byte: path accepted then died (dead tunnel) */
-        rg_probe_finish(rt, 0, 0);
+        /* EOF before any byte: path accepted then died (dead tunnel).
+         * An EOF while connect() is still pending is really a connect
+         * failure surfacing on the read side. */
+        rg_probe_finish(rt, 0, 0,
+                        rt->connected ? RG_FAIL_EOF : RG_FAIL_CONNECT);
         return;
     }
 
@@ -1520,12 +1599,17 @@ rg_probe_readable(ngx_event_t *rev)
         return;
     }
 
-    rg_probe_finish(rt, 0, 0);
+    /* On a refused non-blocking connect epoll reports EPOLLERR and
+     * nginx dispatches the READ handler before the write handler, so
+     * the refusal lands here first: classify by probe phase. */
+    rg_probe_finish(rt, 0, 0,
+                    rt->connected ? RG_FAIL_RESET : RG_FAIL_CONNECT);
 }
 
 
 static void
-rg_probe_finish(rg_probe_rt_t *rt, ngx_uint_t ok, ngx_msec_t rtt_usec)
+rg_probe_finish(rg_probe_rt_t *rt, ngx_uint_t ok, ngx_msec_t rtt_usec,
+    ngx_uint_t reason)
 {
     rg_group_t      *g = rt->g;
     rg_member_t     *m = rt->m;
@@ -1601,12 +1685,14 @@ rg_probe_finish(rg_probe_rt_t *rt, ngx_uint_t ok, ngx_msec_t rtt_usec)
         sm->hist = sm->hist << 1;
     }
 
+    sm->last_fail = ok ? RG_FAIL_NONE : reason;
     sm->probes_done++;
 
-    ngx_log_debug4(NGX_LOG_DEBUG_EVENT, ngx_cycle->log, 0,
-                   "route_group \"%V\" probe %V: %s fail_streak=%ui",
+    ngx_log_debug5(NGX_LOG_DEBUG_EVENT, ngx_cycle->log, 0,
+                   "route_group \"%V\" probe %V: %s fail_streak=%ui reason=%s",
                    &g->name, &m->addr_text, ok ? "ok" : "FAIL",
-                   (ngx_uint_t) sm->fail_streak);
+                   (ngx_uint_t) sm->fail_streak,
+                   rg_fail_name(ok ? RG_FAIL_NONE : reason));
 
     rg_evaluate_group(g);
 }
@@ -1621,6 +1707,7 @@ rg_evaluate_group(rg_group_t *g)
 {
     rg_group_shm_t  *sh;
     rg_member_shm_t *sm;
+    rg_member_t     *ms;
     ngx_uint_t       n, i, fails_pct, ok_cnt, n_seen;
     ngx_uint_t       bad[NGX_RG_MAX_MEMBERS];
     ngx_uint_t       cand = 0, cand_bad = 0;
@@ -1632,6 +1719,7 @@ rg_evaluate_group(rg_group_t *g)
     }
 
     sh = (rg_group_shm_t *) g->shm;
+    ms = g->members.elts;
     n = (ngx_uint_t) sh->nmembers;
 
     for (i = 0; i < n; i++) {
@@ -1650,7 +1738,9 @@ rg_evaluate_group(rg_group_t *g)
                  || (fails_pct > g->fail_pct)
                  || (sm->rtt_baseline > 0
                      && sm->rtt_ewma * 100
-                        > sm->rtt_baseline * g->rtt_ratio_x100);
+                        > sm->rtt_baseline * g->rtt_ratio_x100)
+                 || (ms[i].rtt_max_usec > 0
+                     && sm->rtt_ewma > ms[i].rtt_max_usec);
 
         if (sm->state != NGX_RG_STATE_DOWN) {
             cand++;
@@ -1714,16 +1804,28 @@ rg_evaluate_group(rg_group_t *g)
             }
 
             if (new_state != (ngx_uint_t) sm->state) {
-                ngx_log_error(NGX_LOG_NOTICE, ngx_cycle->log, 0,
-                              "route_group \"%V\": member %ui (%V) state "
-                              "%s -> %s (ewma=%Mms baseline=%Mms "
-                              "fail_streak=%ui)",
-                              &g->name, i,
-                              &((rg_member_t *) g->members.elts)[i].addr_text,
-                              rg_state_name((ngx_uint_t) sm->state),
-                              rg_state_name(new_state),
-                              sm->rtt_ewma / 1000, sm->rtt_baseline / 1000,
-                              (ngx_uint_t) sm->fail_streak);
+                if (sm->last_fail != RG_FAIL_NONE) {
+                    ngx_log_error(NGX_LOG_NOTICE, ngx_cycle->log, 0,
+                                  "route_group \"%V\": member %ui (%V) state "
+                                  "%s -> %s (ewma=%Mms baseline=%Mms "
+                                  "fail_streak=%ui last_fail=%s)",
+                                  &g->name, i, &ms[i].addr_text,
+                                  rg_state_name((ngx_uint_t) sm->state),
+                                  rg_state_name(new_state),
+                                  sm->rtt_ewma / 1000, sm->rtt_baseline / 1000,
+                                  (ngx_uint_t) sm->fail_streak,
+                                  rg_fail_name((ngx_uint_t) sm->last_fail));
+                } else {
+                    ngx_log_error(NGX_LOG_NOTICE, ngx_cycle->log, 0,
+                                  "route_group \"%V\": member %ui (%V) state "
+                                  "%s -> %s (ewma=%Mms baseline=%Mms "
+                                  "fail_streak=%ui)",
+                                  &g->name, i, &ms[i].addr_text,
+                                  rg_state_name((ngx_uint_t) sm->state),
+                                  rg_state_name(new_state),
+                                  sm->rtt_ewma / 1000, sm->rtt_baseline / 1000,
+                                  (ngx_uint_t) sm->fail_streak);
+                }
                 sm->state = new_state;
                 sm->last_change = now;
             }
@@ -1741,8 +1843,7 @@ rg_evaluate_group(rg_group_t *g)
                 ngx_log_error(NGX_LOG_NOTICE, ngx_cycle->log, 0,
                               "route_group \"%V\": member %ui (%V) state "
                               "%s -> up (healthy for %Mms)",
-                              &g->name, i,
-                              &((rg_member_t *) g->members.elts)[i].addr_text,
+                              &g->name, i, &ms[i].addr_text,
                               rg_state_name((ngx_uint_t) sm->state),
                               now - (ngx_msec_t) sm->good_since);
                 sm->state = NGX_RG_STATE_UP;
