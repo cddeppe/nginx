@@ -35,9 +35,16 @@ ngx_event_connect_peer(ngx_peer_connection_t *pc)
     ngx_event_t       *rev, *wev;
     ngx_connection_t  *c;
 
-    rc = pc->get(pc, pc->data);
-    if (rc != NGX_OK) {
-        return rc;
+    rc = NGX_OK;
+
+    /* cddeppe fork fix: guard restored (matches stock nginx).  The fork had
+     * dropped this guard; any caller that leaves pc->get NULL (e.g. the
+     * route_group probe runner) dereferenced a NULL function pointer. */
+    if (pc->get) {
+        rc = pc->get(pc, pc->data);
+        if (rc != NGX_OK) {
+            return rc;
+        }
     }
 
     type = (pc->type ? pc->type : SOCK_STREAM);

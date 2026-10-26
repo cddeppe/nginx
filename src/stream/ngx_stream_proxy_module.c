@@ -102,6 +102,14 @@ static void ngx_stream_proxy_finalize(ngx_stream_session_t *s, ngx_uint_t rc);
 static u_char *ngx_stream_proxy_log_error(ngx_log_t *log, u_char *buf,
     size_t len);
 
+/*
+ * cddeppe fork (route_group): defined in ngx_stream_route_group_module.c.
+ * Rewrites a proxy_pass target that names a route_group into the
+ * health-selected member's addr:port; registers $route_* log variables.
+ */
+ngx_int_t ngx_stream_route_group_resolve(ngx_stream_session_t *s,
+    ngx_str_t *in, ngx_str_t *out);
+
 static void *ngx_stream_proxy_create_srv_conf(ngx_conf_t *cf);
 static char *ngx_stream_proxy_merge_srv_conf(ngx_conf_t *cf, void *parent,
     void *child);
@@ -699,12 +707,25 @@ ngx_stream_proxy_eval(ngx_stream_session_t *s,
     ngx_stream_proxy_srv_conf_t *pscf)
 {
     ngx_str_t               host;
+    ngx_str_t               target;
     ngx_url_t               url;
     ngx_stream_upstream_t  *u;
 
     if (ngx_stream_complex_value(s, pscf->upstream_value, &host) != NGX_OK) {
         return NGX_ERROR;
     }
+
+    /*
+     * cddeppe fork (route_group): if the evaluated proxy_pass target names
+     * a route_group, substitute the currently-selected member's address
+     * (health-based failover).  Otherwise the target passes through
+     * unchanged (raw addr:port behaves exactly like stock nginx).
+     */
+    if (ngx_stream_route_group_resolve(s, &host, &target) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    host = target;
 
     ngx_memzero(&url, sizeof(ngx_url_t));
 
